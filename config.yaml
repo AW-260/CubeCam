@@ -1,0 +1,44 @@
+# CubeCam configuration. Missing keys fall back to defaults in config.py.
+
+camera:
+  enabled: true        # false = keyboard-only mode
+  index: 0             # which webcam (0 = first)
+  backend: auto        # auto | dshow | msmf | v4l2 | avfoundation | any
+  width: 1280
+  height: 720
+  fps: 120             # requested; the camera will use the highest rate it supports
+  fourcc: MJPG         # MJPG usually unlocks higher FPS on USB webcams
+  mirror: true         # selfie view (zone coordinates refer to the mirrored image)
+
+detection:
+  backend: auto        # auto | legacy | tasks  (see README)
+  model_path: models/hand_landmarker.task   # only used by the tasks backend
+  hands_required: 2    # palms that must be inside the zone
+  model_complexity: 0  # legacy backend: 0 = fastest, 1 = more accurate
+  min_detection_confidence: 0.5
+  min_tracking_confidence: 0.5
+  process_width: 640   # frames are downscaled to this width for detection (speed)
+
+# Start zone ("virtual stackmat") as fractions of the frame: x, y = top-left corner.
+zone:
+  x: 0.10
+  y: 0.68
+  w: 0.80
+  h: 0.30
+
+timer:
+  hold_time: 0.3       # seconds hands must rest in the zone to arm the timer
+  debounce: 0.05       # seconds a zone change must persist (filters tracking flicker)
+  inspection: false    # WCA 15 s inspection (toggle at runtime with I)
+  inspection_limit: 15
+  dnf_limit: 17
+  warnings: [8, 12]
+  audio: true          # beep at inspection warnings
+
+storage:
+  path: solves.json
+
+ui:
+  window_name: CubeCam
+  keyboard_canvas: [1280, 720]   # window size when there is no camera
+  show_debug: false              # toggle with H

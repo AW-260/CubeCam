@@ -1,0 +1,8 @@
+# mediapipe 0.10.21 is the last release that still ships the legacy
+# mp.solutions.hands API (no model download needed). Newer 1.x releases are
+# Tasks-API-only; hands.py supports both (see README).
+mediapipe==0.10.21
+opencv-contrib-python==4.11.0.86
+numpy==1.26.4
+PyYAML==6.0.2
+pytest==8.3.4
