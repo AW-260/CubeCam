@@ -37,6 +37,21 @@ DEFAULTS: dict = {
         "audio": True,
     },
     "storage": {"path": "solves.json"},
+    "vision": {
+        "enabled": True,
+        "process_width": 640,
+        "still_time": 0.3,
+        "auto_verify": True,
+        "calibration_path": "calibration.json",
+    },
+    "dataset": {
+        "path": "datasets",
+        "jpeg_quality": 90,
+        "max_queue": 120,
+        "preroll": 0.5,
+        "tail": 0.5,
+        "max_width": 0,
+    },
     "ui": {"window_name": "CubeCam", "keyboard_canvas": [1280, 720], "show_debug": False},
 }
 

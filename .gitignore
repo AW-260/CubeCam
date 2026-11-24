@@ -5,3 +5,6 @@ models/
 solves.json
 solves.*.json
 *.tmp
+# stage 2
+calibration.json
+datasets/

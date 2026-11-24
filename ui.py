@@ -26,7 +26,38 @@ ORANGE = (0, 150, 255)
 RED = (60, 60, 240)
 CYAN = (230, 200, 60)
 
-HELP = "SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  H debug  ESC abort  Q quit"
+HELP = ("SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  C calibrate  S scan  V check  "
+        "R record  H debug  ESC abort  Q quit")
+
+# Sticker colours for drawing (BGR)
+STICKER = {"W": (240, 240, 240), "Y": (0, 215, 255), "R": (40, 40, 215), "O": (0, 140, 255),
+           "G": (60, 185, 60), "B": (205, 95, 25), "?": (90, 90, 90)}
+STATUS_COLOR = {"ok": (80, 220, 80), "mismatch": (40, 40, 255), "uncertain": (0, 220, 255), "unseen": (120, 120, 120)}
+# Net layout: face -> (column, row) in units of faces
+NET_POS = {"U": (1, 0), "L": (0, 1), "F": (1, 1), "R": (2, 1), "B": (3, 1), "D": (1, 2)}
+
+
+@dataclass
+class VisionView:
+    """Everything stage-2 vision wants drawn on top of the camera image."""
+
+    corners: Any = None                      # (4,2) normalised face outline
+    points: Any = None                       # (9,2) normalised sticker centres (true sticker order)
+    labels: list[str] | None = None          # 9 texts ("R", "R/O?", "?")
+    colors: list[str] | None = None          # 9 letters for fill colour
+    confs: list[float] | None = None
+    status: list[str] | None = None          # 9 x ok|mismatch|uncertain|unseen (scramble check)
+    progress: float = 0.0                    # stillness 0..1
+    show_grid: bool = False                  # labels + confidences (debug or a mode)
+    panel_title: str = ""
+    panel_lines: list[str] = field(default_factory=list)
+    net: list[str] | None = None             # 54 colour letters (URFDLB order) for the cube net
+    net_target: str | None = None            # face being scanned
+    net_marks: set = field(default_factory=set)  # facelet indices to mark (unsure / changed)
+    check_text: str = ""
+    check_color: tuple = WHITE
+    rec_on: bool = False
+    rec_active: bool = False
 
 
 @dataclass
@@ -46,6 +77,7 @@ class ViewModel:
     flash: tuple | None = None               # border colour for inspection warnings
     show_debug: bool = False
     debug: dict[str, Any] = field(default_factory=dict)
+    vision: VisionView | None = None
 
 
 def _text(img, s, org, scale, color=WHITE, thick=1, font=FONT, shadow=True):
@@ -84,9 +116,14 @@ class Renderer:
         h, w = img.shape[:2]
         k = h / 720.0  # scale factor relative to a 720p layout
         self._zone(img, vm, k)
+        self._panel_bottom = 0
+        if vm.vision is not None:
+            self._vision_overlay(img, vm.vision, k)
+        self._scramble(img, vm, k)
+        if vm.vision is not None:
+            self._vision_panels(img, vm, k)
         if vm.show_debug:
             self._debug(img, vm, k)
-        self._scramble(img, vm, k)
         self._timer(img, vm, k)
         self._stats(img, vm, k)
         self._status(img, vm, k)
@@ -194,7 +231,96 @@ class Renderer:
             cv2.circle(img, (int(px * w), int(py * h)), int(12 * k), GREEN if inside else RED, -1, cv2.LINE_AA)
         lines = [f"{key}: {val}" for key, val in d.items() if key not in ("hands", "palms", "palms_in_zone")]
         x0 = w - int(330 * k)
-        y0 = int(130 * k)
+        y0 = max(int(130 * k), getattr(self, "_panel_bottom", 0) + int(34 * k))
         _panel(img, x0 - int(10 * k), y0 - int(24 * k), w, y0 + len(lines) * int(24 * k), alpha=0.6)
         for i, line in enumerate(lines):
             _text(img, line, (x0, y0 + i * int(24 * k)), 0.55 * k, YELLOW, 1, shadow=False)
+
+    # ------------------------------------------------------------------ stage 2: vision
+    def _vision_overlay(self, img, v: VisionView, k: float) -> None:
+        if v.points is None or v.corners is None:
+            return
+        h, w = img.shape[:2]
+        corners = (np.asarray(v.corners) * [w, h]).astype(np.int32)
+        pts = np.asarray(v.points) * [w, h]
+        side = float(np.mean(np.linalg.norm(np.roll(corners, -1, axis=0) - corners, axis=1))) / 3
+        col = GREEN if v.progress >= 1 else YELLOW
+        cv2.polylines(img, [corners], True, col, max(1, int(2 * k)), cv2.LINE_AA)
+        if 0 < v.progress < 1:  # stillness bar under the face
+            x0, y0 = int(corners[:, 0].min()), int(corners[:, 1].max()) + int(8 * k)
+            x1 = int(corners[:, 0].max())
+            cv2.rectangle(img, (x0, y0), (x0 + int((x1 - x0) * v.progress), y0 + int(5 * k)), YELLOW, -1)
+        r = max(4, int(side * 0.18))
+        lw = max(2, int(3 * k))
+        for i in range(9):
+            p = (int(pts[i, 0]), int(pts[i, 1]))
+            letter = (v.colors or ["?"] * 9)[i]
+            if v.status is not None:
+                st = v.status[i]
+                cv2.circle(img, p, r + lw, STATUS_COLOR[st], lw, cv2.LINE_AA)
+                if st == "mismatch":
+                    d = int(r * 1.4)
+                    cv2.line(img, (p[0] - d, p[1] - d), (p[0] + d, p[1] + d), STATUS_COLOR[st], lw)
+                    cv2.line(img, (p[0] - d, p[1] + d), (p[0] + d, p[1] - d), STATUS_COLOR[st], lw)
+            if v.show_grid:
+                cv2.circle(img, p, r, STICKER.get(letter, STICKER["?"]), -1, cv2.LINE_AA)
+                cv2.circle(img, p, r, DARK, 1, cv2.LINE_AA)
+                label = (v.labels or ["?"] * 9)[i]
+                conf = (v.confs or [0.0] * 9)[i]
+                _text(img, label, (p[0] - int(8 * k), p[1] - r - int(4 * k)), 0.5 * k, WHITE, 1)
+                _text(img, f"{conf:.2f}", (p[0] - int(14 * k), p[1] + r + int(14 * k)), 0.38 * k,
+                      GREEN if conf >= 0.5 else ORANGE, 1)
+
+    def _vision_panels(self, img, vm: ViewModel, k: float) -> None:
+        v = vm.vision
+        h, w = img.shape[:2]
+        if v.check_text:
+            scale, thick = 0.75 * k, max(1, int(2 * k))
+            tw = cv2.getTextSize(v.check_text, FONT, scale, thick)[0][0]
+            y = int(98 * k)
+            _panel(img, (w - tw) // 2 - int(10 * k), y - int(24 * k), (w + tw) // 2 + int(10 * k),
+                   y + int(10 * k), 0.6)
+            _text(img, v.check_text, ((w - tw) // 2, y), scale, v.check_color, thick, shadow=False)
+        if v.rec_on:
+            y = int(98 * k)
+            col = RED if v.rec_active else GREY
+            cv2.circle(img, (int(24 * k), y - int(7 * k)), int(8 * k), col, -1, cv2.LINE_AA)
+            _text(img, "REC" if v.rec_active else "REC armed", (int(38 * k), y), 0.6 * k, col, max(1, int(2 * k)))
+        if not (v.panel_title or v.net is not None):
+            return
+        cell = int(17 * k)
+        pw = int(370 * k)
+        x0 = w - pw - int(10 * k)
+        y0 = int(120 * k)
+        lines = []
+        for line in v.panel_lines:
+            lines.extend(_wrap(line, pw - int(20 * k), 0.55 * k, 1))
+        net_h = cell * 9 + int(16 * k) if v.net is not None else 0
+        ph = int(40 * k) + len(lines) * int(22 * k) + net_h
+        _panel(img, x0, y0, x0 + pw, y0 + ph, 0.75)
+        self._panel_bottom = y0 + ph
+        _text(img, v.panel_title, (x0 + int(10 * k), y0 + int(28 * k)), 0.75 * k, CYAN, max(1, int(2 * k)),
+              shadow=False)
+        y = y0 + int(52 * k)
+        for line in lines:
+            _text(img, line, (x0 + int(10 * k), y), 0.55 * k, WHITE, 1, shadow=False)
+            y += int(22 * k)
+        if v.net is not None:
+            self._net(img, v, x0 + (pw - cell * 12) // 2, y - int(8 * k), cell)
+
+    def _net(self, img, v: VisionView, x0: int, y0: int, cell: int) -> None:
+        for fi, f in enumerate("URFDLB"):
+            fx, fy = NET_POS[f]
+            ox, oy = x0 + fx * 3 * cell, y0 + fy * 3 * cell
+            for j in range(9):
+                r, c = divmod(j, 3)
+                letter = v.net[fi * 9 + j]
+                p1 = (ox + c * cell, oy + r * cell)
+                p2 = (p1[0] + cell - 1, p1[1] + cell - 1)
+                fill = STICKER.get(letter, STICKER["?"]) if letter != "?" else (45, 45, 45)
+                cv2.rectangle(img, p1, p2, fill, -1)
+                cv2.rectangle(img, p1, p2, DARK, 1)
+                if fi * 9 + j in v.net_marks:
+                    cv2.line(img, p1, p2, (255, 0, 255), 2)
+            if f == v.net_target:
+                cv2.rectangle(img, (ox - 2, oy - 2), (ox + 3 * cell + 1, oy + 3 * cell + 1), YELLOW, 2)
