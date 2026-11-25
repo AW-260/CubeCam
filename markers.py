@@ -108,8 +108,22 @@ class MarkerZoneTracker:
         self.status = status
 
 
-def detect_markers(image_bgr: np.ndarray, detector, mirror: bool, process_width: int = 960) -> dict[int, Point]:
-    """{marker id: centre} in normalised coordinates of the (possibly mirrored) view."""
+def make_detector(dict_name: str = DEFAULT_DICT, refine: bool = False):
+    import cv2
+
+    params = cv2.aruco.DetectorParameters()
+    if refine:
+        params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    return cv2.aruco.ArucoDetector(get_dictionary(dict_name), params)
+
+
+def detect_marker_corners(image_bgr: np.ndarray, detector, mirror: bool,
+                          process_width: int = 960) -> dict[int, np.ndarray]:
+    """{marker id: (4, 2) corners} normalised to the (possibly mirrored) view.
+
+    Corners keep ArUco's order (the marker's own top-left, top-right,
+    bottom-right, bottom-left); mirroring only flips the x coordinates.
+    """
     import cv2
 
     h, w = image_bgr.shape[:2]
@@ -118,30 +132,48 @@ def detect_markers(image_bgr: np.ndarray, detector, mirror: bool, process_width:
         gray = cv2.resize(gray, (process_width, round(h * process_width / w)), interpolation=cv2.INTER_AREA)
     gh, gw = gray.shape[:2]
     corners, ids, _ = detector.detectMarkers(gray)
-    out: dict[int, Point] = {}
+    out: dict[int, np.ndarray] = {}
     if ids is None:
         return out
+    sx, sy = w / gw, h / gh
     for c, i in zip(corners, ids.ravel()):
-        cx, cy = c.reshape(-1, 2).mean(axis=0)
-        x, y = float(cx) / gw, float(cy) / gh
-        out[int(i)] = (1.0 - x if mirror else x, y)
+        # full-resolution pixel-centre coordinates (exact when the detection ran on a smaller copy)
+        p = (c.reshape(-1, 2).astype(np.float64) + 0.5) * (sx, sy) - 0.5
+        if mirror:
+            p[:, 0] = (w - 1) - p[:, 0]      # same as cv2.flip(image, 1)
+        out[int(i)] = p / (w, h)
     return out
 
 
-class MarkerWorker:
-    """Background marker detection. `submit` is O(1) and never blocks the caller."""
+def detect_markers(image_bgr: np.ndarray, detector, mirror: bool, process_width: int = 960) -> dict[int, Point]:
+    """{marker id: centre} in normalised coordinates of the (possibly mirrored) view."""
+    return {i: (float(c[:, 0].mean()), float(c[:, 1].mean()))
+            for i, c in detect_marker_corners(image_bgr, detector, mirror, process_width).items()}
 
-    def __init__(self, cfg: dict | None = None, mirror: bool = True):
-        import cv2
 
-        cfg = cfg or {}
+def plane_from_marker(corners_norm: np.ndarray, size_cm: float, image_size, source: str = "marker",
+                      hfov_deg: float | None = None):
+    """Table plane from one square marker of known side lying on the table."""
+    from plane import plane_from_rectangle
+
+    s = float(size_cm)
+    square = [(0.0, 0.0), (s, 0.0), (s, s), (0.0, s)]
+    return plane_from_rectangle(square, np.asarray(corners_norm) * image_size, image_size, source, hfov_deg)
+
+
+class ArucoWorker:
+    """Background ArUco detection. `submit` is O(1) and never blocks the caller.
+
+    Subclasses (or the default) turn each detection into state in `_handle`,
+    which runs under the lock; `snapshot`-style readers take the same lock.
+    """
+
+    def __init__(self, dict_name: str = DEFAULT_DICT, mirror: bool = True, interval: float = 0.25,
+                 process_width: int = 960, refine: bool = False):
         self.mirror = mirror
-        self.interval = float(cfg.get("interval", 0.25))
-        self.process_width = int(cfg.get("process_width", 960))
-        ids = tuple(int(i) for i in cfg.get("ids", DEFAULT_IDS))
-        self.tracker = MarkerZoneTracker(ids=ids)
-        params = cv2.aruco.DetectorParameters()
-        self._detector = cv2.aruco.ArucoDetector(get_dictionary(str(cfg.get("dictionary", DEFAULT_DICT))), params)
+        self.interval = float(interval)
+        self.process_width = int(process_width)
+        self._detector = make_detector(dict_name, refine)
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._pending: tuple[np.ndarray, float] | None = None
@@ -149,7 +181,10 @@ class MarkerWorker:
         self._running = True
         self.detect_ms = 0.0
         self.error: str | None = None
-        self._thread = threading.Thread(target=self._loop, name="markers", daemon=True)
+        self.image_size: tuple[int, int] | None = None
+        self.corners: dict[int, np.ndarray] = {}
+        self.corners_t: float | None = None
+        self._thread = threading.Thread(target=self._loop, name="aruco", daemon=True)
         self._thread.start()
 
     def submit(self, image: np.ndarray, t: float) -> None:
@@ -161,10 +196,12 @@ class MarkerWorker:
             self._pending = (image, t)
             self._cond.notify()
 
-    def snapshot(self) -> tuple[Zone | None, str, dict[int, Point]]:
+    def latest(self) -> tuple[dict[int, np.ndarray], float | None]:
         with self._lock:
-            tr = self.tracker
-            return tr.zone, tr.status, dict(tr.seen)
+            return dict(self.corners), self.corners_t
+
+    def _handle(self, t: float, corners: dict[int, np.ndarray]) -> None:
+        pass
 
     def _loop(self) -> None:
         while True:
@@ -177,10 +214,12 @@ class MarkerWorker:
                 self._pending = None
             try:
                 t0 = time.perf_counter()
-                found = detect_markers(image, self._detector, self.mirror, self.process_width)
+                corners = detect_marker_corners(image, self._detector, self.mirror, self.process_width)
                 self.detect_ms = (time.perf_counter() - t0) * 1000
                 with self._lock:
-                    self.tracker.update(t, found)
+                    self.image_size = (image.shape[1], image.shape[0])
+                    self.corners, self.corners_t = corners, t
+                    self._handle(t, corners)
             except Exception as exc:  # never let marker detection kill anything
                 self.error = f"{type(exc).__name__}: {exc}"
 
@@ -189,3 +228,41 @@ class MarkerWorker:
             self._running = False
             self._cond.notify()
         self._thread.join(timeout=1.0)
+
+
+class MarkerWorker(ArucoWorker):
+    """The 4 mat markers: a zone that follows them, plus the table plane they give."""
+
+    def __init__(self, cfg: dict | None = None, mirror: bool = True):
+        cfg = cfg or {}
+        super().__init__(str(cfg.get("dictionary", DEFAULT_DICT)), mirror, float(cfg.get("interval", 0.25)),
+                         int(cfg.get("process_width", 960)))
+        ids = tuple(int(i) for i in cfg.get("ids", DEFAULT_IDS))
+        self.size_cm = float(cfg.get("size_mm", 60)) / 10.0
+        self.tracker = MarkerZoneTracker(ids=ids)
+        self.plane = None
+
+    def _handle(self, t: float, corners: dict[int, np.ndarray]) -> None:
+        self.tracker.update(t, {i: (float(c[:, 0].mean()), float(c[:, 1].mean())) for i, c in corners.items()})
+        mine = {i: c for i, c in corners.items() if i in self.tracker.ids}
+        if mine and self.image_size:
+            # The biggest marker in the picture gives the most precise plane.
+            best = max(mine.values(), key=lambda c: _quad_area(c * self.image_size))
+            try:
+                self.plane = plane_from_marker(best, self.size_cm, self.image_size, "markers")
+            except ValueError:
+                pass
+
+    def snapshot(self) -> tuple[Zone | None, str, dict[int, Point]]:
+        with self._lock:
+            tr = self.tracker
+            return tr.zone, tr.status, dict(tr.seen)
+
+    def plane_snapshot(self):
+        with self._lock:
+            return self.plane
+
+
+def _quad_area(p: np.ndarray) -> float:
+    x, y = p[:, 0], p[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2)

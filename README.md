@@ -48,7 +48,8 @@ other OSes OpenCV can't see key releases, so each press *toggles* the held state
 ### Keys
 `SPACE` timer · `2` toggle +2 on last solve · `D` toggle DNF · `Backspace` delete
 last solve · `I` toggle inspection · `N` new scramble · `H` debug overlay ·
-`M` start-zone setup (see below) · `Esc` abort current solve (not recorded) · `Q` quit
+`M` start-zone / mat setup (see below) · `T` table calibration for the AR mat ·
+`A` AR mat look on/off · `Esc` abort current solve (not recorded) · `Q` quit
 
 ## Setting up the start zone ("mat")
 
@@ -65,8 +66,10 @@ they rest, so don't let the timer window or a laptop lid cut them off. Even ligh
 from the front helps the hand tracker. If you move the camera later, set the zone
 again, or use marker mode, which follows the mat.
 
-### Three ways to set it
-Press `M` while the timer is idle. `M` again moves to the next mode. `Enter`
+### Ways to set it
+Press `M` while the timer is idle. `M` again moves to the next mode. With a
+calibrated table (see "AR mat" below) the first mode places the AR mat instead of
+dragging a rectangle. `Enter`
 accepts the zone shown and saves it to `config.yaml` (it persists across
 restarts). `R` starts the current mode over. `Esc` cancels and keeps the old zone.
 While the setup is open the timer ignores your hands, so resting them there
@@ -105,6 +108,126 @@ width), the setup shows it in orange with a warning before you accept. An active
 zone with that problem also shows an orange outline and a "ZONE WARNING" line in
 the status bar.
 
+## AR mat: a virtual mat lying on your table
+
+![AR mat](docs/screenshots/ar_mat/3_ready.jpg)
+
+Once the app knows where the table is, it draws a start mat that looks like it's
+lying flat on your real table in perspective. That outline is the timer's start
+zone. The mat shows the timer state itself:
+* **Idle:** dark mat, "REST HANDS".
+* **Holding:** the hand pads fill up in yellow.
+* **Ready:** green pads and a green glow round the mat.
+* **Solving:** a thin red rim.
+
+Your hands are drawn on top of the mat: it is cut away wherever a hand is.
+The mat graphic is original (no brand names or logos). More screenshots, made from
+a synthetic table with `python tools/ar_screenshots.py`, are in
+`docs/screenshots/ar_mat/`: idle, holding, ready, solving, AR off, the calibration
+screen and the mat placement screen.
+
+Without a table calibration nothing changes: the zone works as described above.
+`A` switches the AR look off, back to the plain zone outline. The zone stays the
+same.
+
+### 1. Calibrate the table (`T`, timer idle)
+The app needs the homography between the table surface (in centimetres) and the
+camera picture. It is saved to `config.yaml` (`table_calibration:`).
+
+**Phone marker (main method)**
+1. Run `python tools/make_phone_marker.py`. This writes `phone_marker.png` (1080 x 2340).
+   `--width/--height` fit other screens.
+2. Copy it to your phone and open it full screen. Turn the brightness up.
+3. **Once:** measure the black square on your phone with a ruler (outer edge to outer
+   edge, mm) and enter it as `table.phone_marker_mm` in `config.yaml`. It sets the
+   real-world scale. Without it a typical phone (56 mm) is assumed and the app says
+   the scale is approximate. Only the mat's real size in cm depends on it; the mat
+   still lies flat in correct perspective.
+4. Lay the phone **flat** on the table where the camera sees it well, roughly where
+   the mat will go. Press `T`. The marker is found automatically, outlined in green,
+   and a 10 cm grid is drawn on the table. Keep the phone still until the bar is
+   full (the corners are averaged over about 10 detections), check that the grid
+   lies flat on the table, and press `Enter`.
+
+**Click 4 corners (fallback: `T` again)**
+Use any rectangle of known size lying on the table: an A4 sheet, a book, the phone
+itself.
+1. Click its 4 corners **in order round its edge**. A 3x zoom loupe follows the mouse.
+   Right-click or `Backspace` undoes a click.
+2. Give the size. `A` = A4, `L` = US Letter (press again to turn it 90°), or type
+   it in cm, e.g. `29.7x21`. The first number is the edge from click 1 to click 2.
+3. Check the grid and press `Enter`.
+
+**4-marker mode** (see above) provides the table plane by itself: each printed
+marker is a square of known size (`markers.size_mm`, 60 by default), so with marker
+mode on, the AR mat is drawn on the printed mat and follows it.
+
+`X` in the calibration screen forgets the saved calibration; the zone stays where
+it was, as a flat zone.
+
+**Warnings.** The app warns when the camera sees the table almost edge-on (under
+about 20°) or the reference is very small in the picture (under about 0.1 % of the
+frame).
+
+*How it's computed:* a plain 4-point homography from a 5 cm marker extrapolates
+badly half a metre away (10-20 % errors at shallow angles in tests). So the camera
+pose is fitted instead (`cv2.solvePnP`). The focal length is estimated from the same
+view and kept within a webcam-like 50-90° field of view; set
+`table.camera_hfov_deg` if you know your camera's. On synthetic tables this gives
+about 1-2 % median scale error over 50 cm (worst case about 10 %). With an A4 sheet
+it is under 3 %.
+
+### 2. Place the mat (`M`)
+After calibrating, mat placement opens by itself (later: `M`).
+* **Drag** the mat with the mouse. It slides across the table in correct perspective
+  (smaller when further away). `[` and `]` rotate it by 5°. `R` puts it back in the
+  default spot. `Enter` saves it (`mat_placement:` and the zone in `config.yaml`).
+* **Hands** (`M` again): rest both hands where you want the mat and hold still for
+  about 2 s. The mat is built on the table centred between your palms and turned
+  to follow the line between them. It keeps its size unless your hands are wider
+  apart; then it gets wider so each palm has about 6 cm of room to the edge.
+* The size is `mat.width_cm` / `mat.height_cm` (default 30 x 22 cm).
+
+### Tips
+* **Camera angle:** the camera must see the table where your hands rest, from
+  above if possible. A laptop camera pointed straight ahead sees the table almost
+  edge-on (warning). Tilt the screen back or raise the camera so the table is
+  seen at 25° or more.
+* **Glare:** reflections on the phone screen hide the marker. Tilt the phone a
+  little away from lamps and windows, or switch the light off for the calibration.
+* **Re-calibrate if the laptop or camera moves.** The mat is tied to the
+  calibration, not to the table, so it would slide with the picture. Press `T`
+  again: the mat keeps its place on screen. With 4-marker mode the mat follows the
+  markers automatically.
+* If the hand cut-out looks wrong (e.g. sleeves the same colour as the table), it
+  is only cosmetic. The timer uses the palm centres, not the picture.
+
+### How it is drawn, and why it doesn't slow the timer
+* The mat graphic is made once per size and state: dark rubber, rounded corners,
+  two pads with grip dots, a status window and a bevelled border. It is warped
+  into perspective with `cv2.warpPerspective`, and the result is cached. A new warp
+  only happens when the plane, the mat or the state changes. Other states are
+  prepared in a background thread, so a state change never stalls a frame.
+* Each frame only composites the cached mat (`cv2.blendLinear`) and cuts out the
+  hands:
+  * The hand shape comes from the landmarks (palm, finger bones, a stub of the
+    forearm).
+  * Skin-coloured pixels near the hands are added, but only if they differ from a
+    slowly updated clean picture of the table under the mat. A light-wood desk is
+    "skin-coloured" too.
+  * The mask is built at reduced resolution and feathered at the edges.
+* **Measured on this machine:** 30 fps webcam, 1280x720, real hand tracking, the
+  same 6 s window with AR off / on / off again:
+
+  | AR mat | processed FPS | AR cost per frame |
+  |---|---|---|
+  | off | 29.7 | - |
+  | on, two hands over the mat | 29.7 | 3.6 ms median (4.8 ms p95) |
+  | on, no hands over the mat | 29.7 | 1.1 ms median |
+  | off again | 29.6 | - |
+
+  Processed FPS stays at the camera's rate. `AR ms` appears in the `H` debug overlay.
+
 ## Configuration (`config.yaml`)
 
 The main settings are the zone, camera index, resolution and requested FPS, hold
@@ -114,7 +237,7 @@ The zone is stored as
 
 ```yaml
 zone:
-  mode: fixed       # fixed = use these points; markers = follow the 4 ArUco markers
+  mode: fixed       # fixed = these points; markers = follow the 4 markers; mat = the AR mat
   points: [[0.1, 0.68], [0.9, 0.68], [0.9, 0.98], [0.1, 0.98]]
 ```
 
@@ -122,7 +245,10 @@ in fractions of the displayed (mirrored) picture, with 0,0 at the top left. `M`
 rewrites only this block and keeps the rest of the file and its comments. Older
 configs with `x`, `y`, `w`, `h` still load as a rectangle. The `markers:`
 section sets the ArUco dictionary and ids (`DICT_4X4_50`, ids 0-3), how often
-they are detected, and at what resolution. Solves are saved to
+they are detected, and at what resolution. `table:` holds the phone marker size,
+its id and optionally the camera's field of view, and `mat:` holds the AR look and
+mat size. The app writes `table_calibration:` (`T`) and `mat_placement:` (`M`)
+itself; delete them to reset. Solves are saved to
 `solves.json` (time, penalty, scramble, timestamp, measured FPS, inspection time)
 and reloaded on startup.
 
@@ -166,6 +292,12 @@ keeps showing the camera and stays usable with the spacebar.
 | `zone_setup.py` | `M` setup modes: drag, hands, markers (pure logic, drawn by `ui.py`) |
 | `markers.py` | ArUco marker detection in a background thread → zone that follows the mat |
 | `tools/make_markers.py` | Printable A4 PDF/PNG of the 4 markers with instructions |
+| `plane.py` | Table plane: homography cm ↔ px, pose-based fit from a known rectangle, angle / size warnings |
+| `table_calib.py` | `T` calibration: phone marker (averaged) or 4 clicks + size (pure logic) |
+| `ar_mat.py` | The mat on the plane (place, rotate, build round hands), mat graphic, cached warps, hand cut-out |
+| `synth_table.py` | Synthetic camera views of a table, phone and hands (tests, screenshots) |
+| `tools/make_phone_marker.py` | Phone-screen PNG with the calibration marker |
+| `tools/ar_screenshots.py` | Renders the AR mat screenshots in `docs/screenshots/ar_mat/` |
 | `timer_state.py` | Pure state machine (no OpenCV, no clock) fed `(timestamp, active)` samples |
 | `stats.py` | best, mo3, ao5, ao12, mean (WCA rules: trim best/worst, DNF = worst) |
 | `scramble.py` | 20-move random-move scrambles (no `R R'`, no `R L R`) |
@@ -195,6 +327,26 @@ and +2), scrambles and storage. `tests/test_zone.py` covers the zone:
   both hands.
 * **Setup modes and detector:** drag, hands and marker setup flows, and the
   detector using the palm centre inside a trapezoid.
+
+`tests/test_ar_mat.py` covers the AR mat:
+* **Plane:** homography round trips (table → image → table), the canonical axes
+  (mirrored too), the horizon, resolution changes, config round trips, the
+  elevation estimate and the "edge-on" / "too small" warnings, and the focal
+  length estimate.
+* **Phone marker:** detected on a synthetic picture of a phone lying on a table at
+  an angle, mirrored and not, with glare. The distances measured through the
+  calibrated plane are within 5 % over 50 cm. Also several poses, averaging that
+  restarts when the phone moves, and the "approximate scale" note.
+* **4-click calibration:** an A4 sheet within 3 %. Also the preset turned 90°
+  (clearly wrong, so it is detected), typed sizes, undo, a bow-tie click order
+  rejected, and the loupe position.
+* **Mat:** placement, dragging in perspective, rotation, refusing the horizon,
+  hands mode on the plane (centre, angle, widening), re-anchoring after
+  re-calibration, and the zone being the projected outline.
+* **Drawing:** the texture states (ready glow), warp caching (nothing re-warped
+  for a steady mat), and the hand mask covering hands but not a skin-coloured
+  table. Also that skin pixels extend the landmark shape, the hands staying on top
+  of the drawn mat, and a per-frame cost check.
 * **Markers:** detected in a synthetic perspective desk scene (mirrored and not),
   the estimated 4th marker and the hold when markers are covered, and the printed
   sheet is detectable with a well-formed PDF.

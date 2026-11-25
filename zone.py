@@ -255,6 +255,7 @@ class HandsZoneBuilder:
     _last_ok: float | None = None
     progress: float = 0.0
     result: Zone | None = None
+    mean_hands: list[np.ndarray] = field(default_factory=list)   # averaged landmarks of the hold
     hint: str = "Rest both hands where you want the mat and hold still"
 
     def reset(self) -> None:
@@ -265,6 +266,7 @@ class HandsZoneBuilder:
         self._last_ok = None
         self.progress = 0.0
         self.result = None
+        self.mean_hands = []
         self.hint = "Rest both hands where you want the mat and hold still"
 
     @staticmethod
@@ -298,8 +300,8 @@ class HandsZoneBuilder:
         self._count += 1
         self.progress = min(1.0, (t - self._start) / self.hold) if self.hold > 0 else 1.0
         if self.progress >= 1.0:
-            mean_hands = [s / self._count for s in self._sum]
-            self.result = zone_from_hands(mean_hands, self.margin, self.min_pad)
+            self.mean_hands = [s / self._count for s in self._sum]
+            self.result = zone_from_hands(self.mean_hands, self.margin, self.min_pad)
             self.hint = "Zone ready"
             return self.result
         return None

@@ -17,7 +17,8 @@ import cv2
 import numpy as np
 
 from camera import Camera
-from config import DEFAULTS, load_config, save_zone
+from ar_mat import Mat, reanchor
+from config import DEFAULTS, ZONE_MODES, load_config, save_blocks
 from detection import DetectorUnavailable, NullDetector, TriggerSample
 from keyinput import SpaceKey
 from models import Penalty, Solve, format_solve, format_time
@@ -25,9 +26,11 @@ from scramble import generate_scramble
 from stats import compute_stats
 from storage import SolveStore
 from timer_state import EventType, State, TimerConfig, TimerStateMachine
-from ui import GREEN, ORANGE, RED, WHITE, YELLOW, Renderer, ViewModel
+from plane import TablePlane
+from table_calib import CalibMode, TableCalibration
+from ui import GREEN, ORANGE, RED, WHITE, YELLOW, ArView, Renderer, ViewModel
 from zone import Zone, zone_warnings
-from zone_setup import SetupMode, ZoneSetup
+from zone_setup import ROTATE_STEP, SetupMode, ZoneSetup
 
 BASE = Path(__file__).resolve().parent
 
@@ -93,9 +96,32 @@ class App:
             self.zone = Zone.from_config(DEFAULTS["zone"])
             zone_msgs.append(f"Zone in config is invalid ({exc}) - using the default zone")
         self.zone_mode = str(c["zone"].get("mode", "fixed"))
-        if self.zone_mode not in ("fixed", "markers"):
+        if self.zone_mode not in ZONE_MODES:
             zone_msgs.append(f"Unknown zone mode {self.zone_mode!r} - using fixed")
             self.zone_mode = "fixed"
+        # AR mat on the table plane (T calibrates the plane, M places the mat)
+        mc = c["mat"]
+        self.ar_enabled = bool(mc.get("ar", True))
+        self.mat_size = (float(mc.get("width_cm", 30.0)), float(mc.get("height_cm", 22.0)))
+        self.plane: TablePlane | None = None
+        self.mat: Mat | None = None
+        try:
+            self.plane = TablePlane.from_config(c.get("table_calibration"))
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            zone_msgs.append(f"Table calibration in config is invalid ({exc}) - press T to calibrate again")
+        try:
+            self.mat = Mat.from_config(c.get("mat_placement"))
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            zone_msgs.append(f"Mat placement in config is invalid ({exc}) - press M to place it again")
+        tc = c["table"]
+        mm = tc.get("phone_marker_mm")
+        hfov = tc.get("camera_hfov_deg")
+        self.calib = TableCalibration(float(mm) if mm else None, int(tc.get("phone_marker_id", 10)),
+                                      hfov_deg=float(hfov) if hfov else None)
+        self.phone = None            # ArucoWorker while calibrating with the phone marker
+        self._phone_t: float | None = None
+        self._hands_px: list = []
+        self._hands_age = 0
         self.markers = None          # MarkerWorker while marker mode (or its setup) is on
         self.setup: ZoneSetup | None = None
         self._canvas = (0, 0)
@@ -161,6 +187,21 @@ class App:
                             "(install opencv-contrib-python) - using the saved zone")
             else:
                 self._start_markers()
+        if self.camera is not None:
+            size = (self.camera.width, self.camera.height)
+            self.calib.image_size = size
+            if self.plane is not None:
+                self.plane = self.plane.scaled_to(size)   # camera resolution may have changed
+        if self.zone_mode == "mat":
+            if self.plane is None or self.mat is None:
+                msgs.append("Zone mode is 'mat' but there is no table calibration / mat - using the saved "
+                            "outline. Press T to calibrate the table.")
+            else:
+                z = self.mat.zone(self.plane)
+                if z is None:
+                    msgs.append("The saved mat isn't on the visible table any more - press M to place it")
+                else:
+                    self.set_zone(z)
         msgs += [f"{w}. Press M to set up the zone." for w in zone_warnings(self.zone)]
         return msgs
 
@@ -186,11 +227,21 @@ class App:
             self._zone_warn_cache = (self.zone, zone_warnings(self.zone))
         return self._zone_warn_cache[1]
 
-    def start_zone_setup(self) -> None:
+    def active_plane(self) -> TablePlane | None:
+        """The table plane in use: the 4 mat markers' while marker mode runs, else the T calibration."""
+        if self.zone_mode == "markers" and self.markers is not None:
+            p = self.markers.plane_snapshot()
+            if p is not None:
+                return p
+        return self.plane
+
+    def start_zone_setup(self, mode: SetupMode | None = None) -> None:
         if self.camera is None or not self.camera.alive:
             self.say("Zone setup needs the camera")
             return
-        self.setup.start(SetupMode.DRAG)
+        plane = self.active_plane()
+        current = self.mat if (self.zone_mode == "mat" and plane is self.plane) else None
+        self.setup.start(mode, plane=plane, mat_size=self.mat_size, current_mat=current)
 
     def _setup_key(self, key: int, ch: str) -> None:
         """Keys while the zone setup is open (everything except Q and H comes here)."""
@@ -200,21 +251,29 @@ class App:
             setup.cancel()
             self.say("Zone setup cancelled - zone unchanged")
         elif code in (10, 13):
+            plane_used = setup.plane
             result = setup.accept()
             if result is None:
                 self.say("Not all 4 markers seen yet" if setup.mode is SetupMode.MARKERS else "No zone yet")
                 return
-            mode, zone = result
+            mode, zone, mat = result
+            blocks = {}
+            if mode == "mat":
+                if plane_used is not self.plane:       # e.g. the plane came from the 4 markers
+                    self.plane = plane_used
+                    blocks["table_calibration"] = plane_used.to_config()
+                self.mat = mat
+                blocks["mat_placement"] = mat.to_config()
             self.zone_mode = mode
             self.set_zone(zone)
-            try:
-                save_zone(self.config_path, mode, zone.to_config())
-                saved = f"saved to {self.config_path.name}"
-            except (OSError, ValueError) as exc:
-                saved = f"NOT saved ({exc})"
+            saved = self._save(zone=(mode, zone.to_config()), **blocks)
             warn = zone_warnings(zone)
-            self.say(f"Zone set ({'follows the markers' if mode == 'markers' else mode}), {saved}"
-                     + (f". Warning: {'; '.join(warn)}" if warn else ""), 5.0 if warn else 3.0)
+            what = {"markers": "follows the markers", "mat": "AR mat"}.get(mode, mode)
+            self.say(f"Zone set ({what}), {saved}" + (f". Warning: {'; '.join(warn)}" if warn else ""),
+                     5.0 if warn else 3.0)
+        elif ch in ("[", "]"):
+            if not setup.rotate(ROTATE_STEP if ch == "]" else -ROTATE_STEP):
+                self.say("Nothing to rotate (or it would leave the visible table)")
         elif ch == "m":
             if setup.cycle() is None:
                 self.say("Zone setup closed - zone unchanged")
@@ -227,8 +286,159 @@ class App:
             self._stop_markers()
 
     def on_mouse(self, event, x, y, flags, param) -> None:
-        if self.setup is not None and self.setup.active:
+        if self.calib.active:
+            self.calib.on_mouse(event, x, y, *self._canvas)
+        elif self.setup is not None and self.setup.active:
             self.setup.on_mouse(event, x, y, *self._canvas)
+
+    def _save(self, zone=None, **blocks) -> str:
+        try:
+            save_blocks(self.config_path, zone=zone, **blocks)
+            return f"saved to {self.config_path.name}"
+        except (OSError, ValueError) as exc:
+            return f"NOT saved ({exc})"
+
+    # ------------------------------------------------------- table calibration
+    def start_calibration(self) -> None:
+        from markers import aruco_available
+
+        if self.camera is None or not self.camera.alive:
+            self.say("Table calibration needs the camera")
+            return
+        self.calib.start(CalibMode.PHONE, (self.camera.width, self.camera.height))
+        if aruco_available():
+            self._start_phone()
+        else:
+            self.calib.cycle()   # no aruco module: straight to the click method
+            self.say("OpenCV has no aruco module - click 4 corners of a known rectangle instead")
+
+    def _start_phone(self) -> None:
+        if self.phone is None:
+            from markers import ArucoWorker
+
+            tc = self.cfg["table"]
+            # full resolution + sub-pixel corners: calibration runs rarely, precision matters
+            self.phone = ArucoWorker(str(tc.get("dictionary", "DICT_4X4_50")), self.mirror, interval=0.12,
+                                     process_width=0, refine=True)
+            self._phone_t = None
+
+    def _stop_phone(self) -> None:
+        if self.phone is not None:
+            self.phone.close()
+            self.phone = None
+
+    def _update_phone(self, raw_image, t: float) -> None:
+        if self.phone is None:
+            return
+        self.phone.submit(raw_image, t)
+        corners, ct = self.phone.latest()
+        if ct is not None and ct != self._phone_t:
+            self._phone_t = ct
+            self.calib.update_phone(t, corners, self.phone.image_size)
+        else:
+            self.calib.update_phone(t, None)
+
+    def _calib_key(self, key: int, ch: str) -> None:
+        calib = self.calib
+        code = key & 0xFF
+        if calib.on_key(key):
+            pass
+        elif code == 27:
+            calib.cancel()
+            self.say("Table calibration cancelled")
+        elif code in (10, 13):
+            plane = calib.accept()
+            if plane is None:
+                self.say("Nothing to accept yet" + (" - show the phone marker" if calib.mode is CalibMode.PHONE
+                                                    else " - click 4 corners and give the size"))
+            else:
+                self._apply_plane(plane)
+        elif ch == "t":
+            if calib.cycle() is None:
+                self.say("Table calibration closed - unchanged")
+        elif ch == "x":
+            calib.cancel()
+            self._forget_plane()
+        if not (calib.active and calib.mode is CalibMode.PHONE):
+            self._stop_phone()
+
+    def _apply_plane(self, plane: TablePlane) -> None:
+        old = self.plane
+        self.plane = plane
+        blocks: dict = {"table_calibration": plane.to_config()}
+        zone = None
+        if self.zone_mode == "mat" and self.mat is not None and old is not None:
+            moved = reanchor(self.mat, old, plane)   # keep the mat where it was on screen
+            if moved is not None:
+                self.mat = moved
+                z = moved.zone(plane)
+                self.set_zone(z)
+                blocks["mat_placement"] = moved.to_config()
+                zone = ("mat", z.to_config())
+        saved = self._save(zone=zone, **blocks)
+        note = "" if self.calib.scale_known or plane.source != "phone" else \
+            " Scale approximate - set table.phone_marker_mm."
+        warn = plane.warnings()
+        self.say(f"Table calibrated ({plane.source}, camera ~{plane.elevation_deg():.0f} deg above the table), "
+                 f"{saved}.{note}" + (f" Warning: {'; '.join(warn)}" if warn else ""), 6.0)
+        if self.zone_mode != "mat":
+            self.start_zone_setup()       # next step: place the mat
+
+    def _forget_plane(self) -> None:
+        if self.plane is None:
+            self.say("No table calibration to forget")
+            return
+        self.plane = None
+        zone = None
+        if self.zone_mode == "mat":
+            self.zone_mode = "fixed"          # keep the mat's outline as a flat zone
+            zone = ("fixed", self.zone.to_config())
+        saved = self._save(zone=zone, table_calibration=None)
+        self.say(f"Table calibration forgotten ({saved}); the zone stays where it was")
+
+    # --------------------------------------------------------------- AR view
+    def _hands_in_px(self, sample: TriggerSample) -> list:
+        """Hand landmarks in canvas pixels; the last ones are kept for 3 frames if tracking flickers."""
+        hands = sample.debug.get("hands")
+        W, H = self._canvas
+        if hands:
+            self._hands_px = [np.asarray(h, dtype=np.float64)[:, :2] * (W, H) for h in hands]
+            self._hands_age = 0
+        else:
+            self._hands_age += 1
+            if self._hands_age > 3:
+                self._hands_px = []
+        return self._hands_px
+
+    def _marker_mat_size(self, quad: np.ndarray) -> tuple[float, float]:
+        plane = self.markers.plane_snapshot() if self.markers is not None else None
+        if plane is None:
+            return self.mat_size
+        c, ok = plane.to_table(quad)
+        if not ok.all():
+            return self.mat_size
+        w = (np.linalg.norm(c[1] - c[0]) + np.linalg.norm(c[2] - c[3])) / 2
+        h = (np.linalg.norm(c[3] - c[0]) + np.linalg.norm(c[2] - c[1])) / 2
+        return (round(float(w), 1), round(float(h), 1)) if w > 2 and h > 2 else self.mat_size
+
+    def ar_view(self, zone_mode: str, progress: float, sample: TriggerSample) -> ArView | None:
+        hands = self._hands_in_px(sample)
+        if not self.ar_enabled or zone_mode == "off" or self.calib.active:
+            return None
+        quad = size = None
+        state = zone_mode if zone_mode in ("idle", "holding", "ready", "solving") else "idle"
+        if self.setup is not None and self.setup.active:
+            m, plane = self.setup.candidate_mat, self.setup.plane
+            if m is not None and plane is not None:
+                quad, size = m.image_quad(plane), (m.width_cm, m.height_cm)
+        elif self.zone_mode == "mat" and self.plane is not None and self.mat is not None:
+            quad, size = self.mat.image_quad(self.plane), (self.mat.width_cm, self.mat.height_cm)
+        elif self.zone_mode == "markers" and self.markers is not None and len(self.zone.points) == 4:
+            quad = np.array(self.zone.points) * self._canvas
+            size = self._marker_mat_size(quad)
+        if quad is None:
+            return None
+        return ArView(quad, size, state, progress if state == "holding" else 0.0, hands)
 
     # ---------------------------------------------------------------- helpers
     def say(self, msg: str, seconds: float = 3.0) -> None:
@@ -288,14 +498,25 @@ class App:
         busy = self.machine.state in (State.SOLVING, State.INSPECTION, State.READY)
         if ch == "q":
             return False
+        if self.calib.active and ch != "h":
+            self._calib_key(key, ch)
+            return True
         if self.setup is not None and self.setup.active and ch != "h":
             self._setup_key(key, ch)
             return True
-        if ch == "m":
+        if ch in ("m", "t"):
             if busy:
                 self.say("Finish or abort (ESC) the current solve first")
-            else:
+            elif ch == "m":
                 self.start_zone_setup()
+            else:
+                self.start_calibration()
+            return True
+        if ch == "a":
+            self.ar_enabled = not self.ar_enabled
+            has_mat = self.zone_mode in ("mat", "markers") and (self.plane is not None or self.markers is not None)
+            self.say(f"AR mat {'ON' if self.ar_enabled else 'OFF (plain zone outline)'}"
+                     + ("" if has_mat or not self.ar_enabled else " - calibrate the table (T) and place the mat (M)"))
             return True
         if key & 0xFF == 27:
             self.handle_events(self.machine.abort(t))
@@ -383,7 +604,8 @@ class App:
             )
         else:
             status.append(f"Keyboard mode | loop {eff:.0f} Hz | timing resolution {res}")
-        zone_txt = "markers" if self.zone_mode == "markers" else ("rectangle" if self.zone.is_rect else "polygon")
+        zone_txt = {"markers": "markers", "mat": "AR mat" if self.ar_enabled else "mat (AR off)"}.get(
+            self.zone_mode, "rectangle" if self.zone.is_rect else "polygon")
         if self.markers is not None and self.zone_mode == "markers":
             zone_txt += f" ({self.markers.snapshot()[1]})"
         status.append(
@@ -398,8 +620,10 @@ class App:
         if self.markers is not None and self.markers.error:
             status.append(f"Marker detection error: {self.markers.error}")
         setup_view = self.setup.view() if self.setup is not None else None
-        if setup_view is not None:
+        calib_view = self.calib.view()
+        if setup_view is not None or calib_view is not None:
             zone_mode = "setup"
+        ar = self.ar_view(zone_mode if setup_view is None else "setup", m.hold_progress(t), sample)
 
         debug = {
             "state": st.value,
@@ -415,6 +639,10 @@ class App:
             debug.update({k: sample.debug[k] for k in ("hands", "palms", "palms_in_zone")})
         if self.markers is not None:
             debug["marker ms"] = f"{self.markers.detect_ms:.1f}"
+        if self.plane is not None:
+            debug["table"] = f"{self.plane.source}, {self.plane.elevation_deg():.0f} deg"
+        if ar is not None:
+            debug["AR ms"] = f"{self.renderer.ar.last_ms:.1f}"
 
         stats = compute_stats(self.solves)
         return ViewModel(
@@ -435,6 +663,8 @@ class App:
             debug=debug,
             setup=setup_view,
             zone_warning=bool(zone_warn),
+            calib=calib_view,
+            ar=ar,
         )
 
     # ------------------------------------------------------------------- loop
@@ -461,6 +691,7 @@ class App:
                     t = frame.t
                     img = cv2.flip(frame.image, 1) if self.mirror else frame.image.copy()
                     self._update_markers(frame.image, t)
+                    self._update_phone(frame.image, t)
                     try:
                         sample = self.detector.process(img, t)
                     except Exception as exc:  # never let detection kill the timer
@@ -482,6 +713,8 @@ class App:
                 if self.setup is not None and self.setup.active:
                     # Resting your hands to set the zone must not arm the timer.
                     self._update_setup(t, sample)
+                    trigger = False
+                if self.calib.active:
                     trigger = False
                 self.handle_events(self.machine.update(t, trigger))
                 vm = self.build_view(t, sample, space_down, img.shape[1])
@@ -513,6 +746,8 @@ class App:
 
     def close(self) -> None:
         self._stop_markers()
+        self._stop_phone()
+        self.renderer.close()
         if self.camera is not None:
             self.camera.close()
         self.detector.close()

@@ -24,7 +24,7 @@ detection:
 # rectangle, rest your hands, or use 4 printed markers); M saves it here.
 # Old configs with x / y / w / h (a rectangle) still work.
 zone:
-  mode: fixed       # fixed = use these points; markers = follow the 4 ArUco markers
+  mode: fixed       # fixed = these points; markers = follow the 4 markers; mat = the AR mat
   points: [[0.1, 0.68], [0.9, 0.68], [0.9, 0.98], [0.1, 0.98]]
 
 # Marker mode (tools/make_markers.py prints them). Detection runs in a
@@ -34,6 +34,21 @@ markers:
   ids: [0, 1, 2, 3]
   interval: 0.25
   process_width: 960
+  size_mm: 60          # printed marker side (make_markers --size); gives the table scale
+
+# Table plane for the AR mat (key T). Open tools/make_phone_marker.py's PNG on
+# your phone, measure the black square ONCE with a ruler and enter it here.
+table:
+  phone_marker_mm: null   # e.g. 52.5; null = assume a typical phone (scale approximate)
+  phone_marker_id: 10
+  dictionary: DICT_4X4_50
+  camera_hfov_deg: null   # camera's horizontal field of view if you know it; null = estimated
+
+# The AR mat drawn on the table (needs a table calibration; A toggles the look).
+mat:
+  ar: true
+  width_cm: 30
+  height_cm: 22
 
 timer:
   hold_time: 0.3       # seconds hands must rest in the zone to arm the timer

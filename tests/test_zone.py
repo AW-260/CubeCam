@@ -241,8 +241,8 @@ def test_setup_drag_mode():
     assert s.view().drag is not None and s.candidate is None
     s.on_mouse(EVENT_LBUTTONUP, 1152, 700, 1280, 720)
     assert np.allclose(s.candidate.bbox, (0.1, 400 / 720, 0.9, 700 / 720))
-    mode, zone = s.accept()
-    assert mode == "fixed" and zone.is_rect and not s.active
+    mode, zone, mat = s.accept()
+    assert mode == "fixed" and zone.is_rect and mat is None and not s.active
 
 
 def test_setup_drag_click_is_ignored_and_escape_cancels():
@@ -304,7 +304,7 @@ def test_setup_markers_mode():
     z = Zone(((0.1, 0.6), (0.9, 0.6), (0.9, 0.95), (0.1, 0.95)))
     s.update(0.3, [], z, "4/4 markers", [p for p in z.points])
     assert "4/4" in " ".join(s.view().lines)
-    assert s.accept() == ("markers", z)
+    assert s.accept() == ("markers", z, None)
 
 
 def test_setup_view_warns_about_bad_candidate():

@@ -7,11 +7,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from ar_mat import ArMatRenderer
 from hands import HAND_CONNECTIONS
 from models import format_time
 from stats import SessionStats
 from timer_state import State
 from zone import Zone
+from table_calib import CalibView
 from zone_setup import SetupView
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -27,7 +29,19 @@ ORANGE = (0, 150, 255)
 RED = (60, 60, 240)
 CYAN = (230, 200, 60)
 
-HELP = "SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  M zone setup  H debug  ESC abort  Q quit"
+HELP = ("SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  M zone/mat  T table  A AR mat  "
+        "H debug  ESC abort  Q quit")
+
+
+@dataclass
+class ArView:
+    """The AR mat to draw this frame."""
+
+    quad: np.ndarray                         # (4, 2) image px: far-left, far-right, near-right, near-left
+    size_cm: tuple[float, float]
+    state: str = "idle"                      # idle | holding | ready | solving
+    progress: float = 0.0
+    hands_px: list = field(default_factory=list)   # (21, 2) landmark arrays in image px
 
 
 @dataclass
@@ -49,6 +63,8 @@ class ViewModel:
     debug: dict[str, Any] = field(default_factory=dict)
     setup: SetupView | None = None           # zone setup overlay (key M)
     zone_warning: bool = False               # zone mostly off-screen / too small
+    calib: CalibView | None = None           # table calibration overlay (key T)
+    ar: ArView | None = None                 # AR mat (replaces the flat zone outline)
 
 
 def _text(img, s, org, scale, color=WHITE, thick=1, font=FONT, shadow=True):
@@ -98,12 +114,26 @@ def _wrap(s: str, max_w: int, scale: float, thick: int) -> list[str]:
 
 
 class Renderer:
+    def __init__(self):
+        self.ar = ArMatRenderer()
+
+    def close(self) -> None:
+        self.ar.close()
+
     def render(self, img: np.ndarray, vm: ViewModel) -> np.ndarray:
         h, w = img.shape[:2]
         k = h / 720.0  # scale factor relative to a 720p layout
+        loupe = None
+        if vm.calib is not None and vm.calib.mouse_px is not None:
+            loupe = self._loupe_crop(img, vm.calib.mouse_px, k)   # from the clean frame, before overlays
+        if vm.ar is not None:
+            a = vm.ar
+            self.ar.draw(img, a.quad, a.size_cm, a.state, a.progress, a.hands_px)
         self._zone(img, vm, k)
         if vm.setup is not None:
-            self._setup(img, vm.setup, k)
+            self._setup(img, vm.setup, k, on_ar=vm.ar is not None)
+        if vm.calib is not None:
+            self._calib(img, vm.calib, loupe, k)
         if vm.show_debug:
             self._debug(img, vm, k)
         self._scramble(img, vm, k)
@@ -124,7 +154,10 @@ class Renderer:
         pts = vm.zone.to_pixels(w, h)
         thick = max(2, int(3 * k))
         if vm.zone_mode == "setup":  # current zone, faint, under the setup overlay
-            cv2.polylines(img, [pts], True, GREY, 1, cv2.LINE_AA)
+            if vm.ar is None:
+                cv2.polylines(img, [pts], True, GREY, 1, cv2.LINE_AA)
+            return
+        if vm.ar is not None:        # the AR mat shows the state itself
             return
         color = {"idle": GREY, "holding": YELLOW, "ready": GREEN, "solving": RED}.get(vm.zone_mode, GREY)
         if vm.zone_warning and vm.zone_mode == "idle":
@@ -150,13 +183,14 @@ class Renderer:
             lx = min(max(0, (lx1 + lx2 - tw) // 2), max(0, w - tw))
         _text(img, label, (lx, ly1 + int(28 * k)), scale, color, lthick)
 
-    def _setup(self, img, sv: SetupView, k: float) -> None:
+    def _setup(self, img, sv: SetupView, k: float, on_ar: bool = False) -> None:
         h, w = img.shape[:2]
         thick = max(2, int(3 * k))
         if sv.candidate is not None:
             pts = sv.candidate.to_pixels(w, h)
             color = ORANGE if sv.warnings else CYAN
-            _fill_poly(img, pts, color, 0.2)
+            if not on_ar:                    # the AR mat preview already shows the area
+                _fill_poly(img, pts, color, 0.2)
             cv2.polylines(img, [pts], True, color, thick, cv2.LINE_AA)
             for p in pts[:, 0]:
                 cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(6 * k)), color, -1, cv2.LINE_AA)
@@ -168,14 +202,19 @@ class Renderer:
             cv2.drawMarker(img, c, GREEN, cv2.MARKER_CROSS, int(28 * k), thick)
         for x, y in sv.palms:
             cv2.circle(img, (int(x * w), int(y * h)), int(12 * k), YELLOW, -1, cv2.LINE_AA)
-        # Instruction panel under the scramble line.
+        self._instructions(img, sv.title, sv.lines, sv.warnings, sv.progress, k)
+
+    def _instructions(self, img, title: str, lines_in: list[str], warnings: list[str], progress: float,
+                      k: float) -> None:
+        """Instruction panel under the scramble line."""
+        h, w = img.shape[:2]
         scale, lh = 0.62 * k, int(26 * k)
-        lines = [ln for s in sv.lines for ln in _wrap(s, w - int(300 * k), scale, 1)]
-        warn = [ln for s in sv.warnings for ln in _wrap("WARNING: " + s, w - int(300 * k), scale, 1)]
+        lines = [ln for s in lines_in for ln in _wrap(s, w - int(300 * k), scale, 1)]
+        warn = [ln for s in warnings for ln in _wrap("WARNING: " + s, w - int(300 * k), scale, 1)]
         x0, y0 = int(240 * k), int(92 * k)
-        bottom = y0 + int(34 * k) + lh * (len(lines) + len(warn)) + (int(18 * k) if sv.progress > 0 else 0)
+        bottom = y0 + int(34 * k) + lh * (len(lines) + len(warn)) + (int(18 * k) if progress > 0 else 0)
         _panel(img, x0 - int(14 * k), y0 - int(8 * k), w - int(30 * k), bottom, alpha=0.75)
-        _text(img, sv.title, (x0, y0 + int(22 * k)), 0.8 * k, CYAN, max(1, int(2 * k)), shadow=False)
+        _text(img, title, (x0, y0 + int(22 * k)), 0.8 * k, CYAN, max(1, int(2 * k)), shadow=False)
         y = y0 + int(22 * k) + lh
         for ln in lines:
             _text(img, ln, (x0, y), scale, WHITE, 1, shadow=False)
@@ -183,10 +222,54 @@ class Renderer:
         for ln in warn:
             _text(img, ln, (x0, y), scale, ORANGE, max(1, int(2 * k)), shadow=False)
             y += lh
-        if sv.progress > 0:
+        if progress > 0:
             bar_w = w - int(30 * k) - x0 - int(14 * k)
             cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + bar_w, y), GREY, 1)
-            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + int(bar_w * sv.progress), y), YELLOW, -1)
+            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + int(bar_w * min(progress, 1.0)), y), YELLOW, -1)
+
+    # ------------------------------------------------------- table calibration
+    LOUPE_SRC = 60      # half-size of the magnified area (px, at 720p)
+    LOUPE_ZOOM = 3
+
+    def _loupe_crop(self, img, mouse, k):
+        h, w = img.shape[:2]
+        r = int(self.LOUPE_SRC * k)
+        x, y = int(round(mouse[0])), int(round(mouse[1]))
+        pad = cv2.copyMakeBorder(img, r, r, r, r, cv2.BORDER_CONSTANT, value=(40, 40, 40))
+        return pad[y:y + 2 * r, x:x + 2 * r].copy(), (x - r, y - r)
+
+    def _calib(self, img, cv_: CalibView, loupe, k: float) -> None:
+        h, w = img.shape[:2]
+        for line in cv_.grid_px:
+            cv2.polylines(img, [np.int32(np.round(line))], False, CYAN, 1, cv2.LINE_AA)
+        if cv_.marker_px is not None:
+            cv2.polylines(img, [np.int32(np.round(cv_.marker_px))], True, GREEN, max(2, int(3 * k)), cv2.LINE_AA)
+        clicks = [tuple(map(int, map(round, c))) for c in cv_.clicks_px]
+        if len(clicks) > 1:
+            cv2.polylines(img, [np.int32(clicks)], len(clicks) == 4, YELLOW, max(1, int(2 * k)), cv2.LINE_AA)
+        for i, c in enumerate(clicks):
+            cv2.circle(img, c, max(4, int(6 * k)), YELLOW, -1, cv2.LINE_AA)
+            _text(img, str(i + 1), (c[0] + int(8 * k), c[1] - int(8 * k)), 0.7 * k, YELLOW, max(1, int(2 * k)))
+        if loupe is not None:
+            crop, (ox, oy) = loupe
+            z = self.LOUPE_ZOOM
+            big = cv2.resize(crop, None, fx=z, fy=z, interpolation=cv2.INTER_NEAREST)
+            bh, bw = big.shape[:2]
+            for i, c in enumerate(clicks):   # earlier clicks, inside the loupe
+                q = ((c[0] - ox) * z, (c[1] - oy) * z)
+                if 0 <= q[0] < bw and 0 <= q[1] < bh:
+                    cv2.circle(big, (int(q[0]), int(q[1])), 5, YELLOW, 2, cv2.LINE_AA)
+            cx, cy = bw // 2, bh // 2
+            cv2.line(big, (cx - 14, cy), (cx + 14, cy), RED, 1)
+            cv2.line(big, (cx, cy - 14), (cx, cy + 14), RED, 1)
+            # top-right, or top-left if the mouse is over there
+            mx = cv_.mouse_px[0]
+            lx = w - bw - int(16 * k) if mx < w * 0.6 else int(16 * k)
+            ly = h - bh - int(90 * k)
+            img[ly:ly + bh, lx:lx + bw] = big
+            cv2.rectangle(img, (lx - 1, ly - 1), (lx + bw, ly + bh), WHITE, 2)
+            _text(img, f"x{z}", (lx + 6, ly + int(22 * k)), 0.6 * k, WHITE, 1)
+        self._instructions(img, cv_.title, cv_.lines, cv_.warnings, cv_.progress, k)
 
     def _scramble(self, img, vm: ViewModel, k: float) -> None:
         if not vm.scramble:
