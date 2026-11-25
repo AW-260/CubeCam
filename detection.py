@@ -10,30 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, Sequence, runtime_checkable
 
+from zone import Zone  # noqa: F401  (re-exported: the start zone is a polygon, see zone.py)
+
 
 class DetectorUnavailable(RuntimeError):
     """Raised when a detector cannot be constructed (missing lib, model, DLL...)."""
-
-
-@dataclass(frozen=True)
-class Zone:
-    """Rectangle in normalised [0, 1] frame coordinates."""
-
-    x: float
-    y: float
-    w: float
-    h: float
-
-    def contains(self, px: float, py: float) -> bool:
-        return self.x <= px <= self.x + self.w and self.y <= py <= self.y + self.h
-
-    def to_pixels(self, width: int, height: int) -> tuple[int, int, int, int]:
-        return (
-            int(self.x * width),
-            int(self.y * height),
-            int((self.x + self.w) * width),
-            int((self.y + self.h) * height),
-        )
 
 
 @dataclass

@@ -7,11 +7,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from detection import Zone
 from hands import HAND_CONNECTIONS
 from models import format_time
 from stats import SessionStats
 from timer_state import State
+from zone import Zone
+from zone_setup import SetupView
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
@@ -26,7 +27,7 @@ ORANGE = (0, 150, 255)
 RED = (60, 60, 240)
 CYAN = (230, 200, 60)
 
-HELP = "SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  H debug  ESC abort  Q quit"
+HELP = "SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  M zone setup  H debug  ESC abort  Q quit"
 
 
 @dataclass
@@ -39,13 +40,15 @@ class ViewModel:
     stats: SessionStats | None = None
     recent: list[str] = field(default_factory=list)
     zone: Zone | None = None
-    zone_mode: str = "idle"                  # idle | holding | ready | solving | off
+    zone_mode: str = "idle"                  # idle | holding | ready | solving | setup | off
     hold_progress: float = 0.0
     status_lines: list[str] = field(default_factory=list)
     message: str | None = None
     flash: tuple | None = None               # border colour for inspection warnings
     show_debug: bool = False
     debug: dict[str, Any] = field(default_factory=dict)
+    setup: SetupView | None = None           # zone setup overlay (key M)
+    zone_warning: bool = False               # zone mostly off-screen / too small
 
 
 def _text(img, s, org, scale, color=WHITE, thick=1, font=FONT, shadow=True):
@@ -62,6 +65,21 @@ def _panel(img, x1, y1, x2, y2, alpha=0.55, color=DARK):
     roi = img[y1:y2, x1:x2]
     overlay = np.empty_like(roi)
     overlay[:] = color
+    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
+
+
+def _fill_poly(img, pts: np.ndarray, color, alpha: float) -> None:
+    """Translucent polygon fill (only the polygon's bounding box is blended)."""
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(pts[:, 0, 0].min())), max(0, int(pts[:, 0, 1].min()))
+    x2, y2 = min(w, int(pts[:, 0, 0].max()) + 1), min(h, int(pts[:, 0, 1].max()) + 1)
+    if x2 <= x1 or y2 <= y1:
+        return
+    roi = img[y1:y2, x1:x2]
+    mask = np.zeros(roi.shape[:2], np.uint8)
+    cv2.fillPoly(mask, [pts - np.array([x1, y1], np.int32)], 255)
+    overlay = roi.copy()
+    overlay[mask > 0] = color
     cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
 
 
@@ -84,6 +102,8 @@ class Renderer:
         h, w = img.shape[:2]
         k = h / 720.0  # scale factor relative to a 720p layout
         self._zone(img, vm, k)
+        if vm.setup is not None:
+            self._setup(img, vm.setup, k)
         if vm.show_debug:
             self._debug(img, vm, k)
         self._scramble(img, vm, k)
@@ -101,17 +121,72 @@ class Renderer:
         if vm.zone is None or vm.zone_mode == "off":
             return
         h, w = img.shape[:2]
-        x1, y1, x2, y2 = vm.zone.to_pixels(w, h)
+        pts = vm.zone.to_pixels(w, h)
+        thick = max(2, int(3 * k))
+        if vm.zone_mode == "setup":  # current zone, faint, under the setup overlay
+            cv2.polylines(img, [pts], True, GREY, 1, cv2.LINE_AA)
+            return
         color = {"idle": GREY, "holding": YELLOW, "ready": GREEN, "solving": RED}.get(vm.zone_mode, GREY)
+        if vm.zone_warning and vm.zone_mode == "idle":
+            color = ORANGE
         if vm.zone_mode in ("ready", "holding"):
-            _panel(img, x1, y1, x2, y2, alpha=0.25, color=color)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, max(2, int(3 * k)))
+            _fill_poly(img, pts, color, 0.25)
+        cv2.polylines(img, [pts], True, color, thick, cv2.LINE_AA)
+        x1, y1 = int(pts[:, 0, 0].min()), int(pts[:, 0, 1].min())
+        x2, y2 = int(pts[:, 0, 0].max()), int(pts[:, 0, 1].max())
+        # Keep the label and the hold bar on screen even if the zone pokes out of the frame.
+        lx1, lx2 = max(0, x1), min(w, x2)
+        ly1, ly2 = max(0, y1), min(h - 1, y2)
         if vm.zone_mode == "holding" and vm.hold_progress > 0:
-            px = x1 + int((x2 - x1) * vm.hold_progress)
-            cv2.rectangle(img, (x1, y2 - int(10 * k)), (px, y2), color, -1)
+            px = lx1 + int((lx2 - lx1) * vm.hold_progress)
+            cv2.rectangle(img, (lx1, ly2 - int(10 * k)), (px, ly2), color, -1)
         label = {"idle": "START ZONE - rest both hands here", "holding": "hold...",
                  "ready": "READY - lift to start", "solving": "return hands to stop"}[vm.zone_mode]
-        _text(img, label, (x1 + int(10 * k), y1 + int(28 * k)), 0.7 * k, color, max(1, int(2 * k)))
+        scale, lthick = 0.7 * k, max(1, int(2 * k))
+        if vm.zone.is_rect:
+            lx = lx1 + int(10 * k)
+        else:  # slanted sides: centre the label so it stays inside the shape
+            tw = cv2.getTextSize(label, FONT, scale, lthick)[0][0]
+            lx = min(max(0, (lx1 + lx2 - tw) // 2), max(0, w - tw))
+        _text(img, label, (lx, ly1 + int(28 * k)), scale, color, lthick)
+
+    def _setup(self, img, sv: SetupView, k: float) -> None:
+        h, w = img.shape[:2]
+        thick = max(2, int(3 * k))
+        if sv.candidate is not None:
+            pts = sv.candidate.to_pixels(w, h)
+            color = ORANGE if sv.warnings else CYAN
+            _fill_poly(img, pts, color, 0.2)
+            cv2.polylines(img, [pts], True, color, thick, cv2.LINE_AA)
+            for p in pts[:, 0]:
+                cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(6 * k)), color, -1, cv2.LINE_AA)
+        if sv.drag is not None:
+            (ax, ay), (bx, by) = sv.drag
+            cv2.rectangle(img, (int(ax * w), int(ay * h)), (int(bx * w), int(by * h)), YELLOW, thick)
+        for x, y in sv.markers:
+            c = (int(x * w), int(y * h))
+            cv2.drawMarker(img, c, GREEN, cv2.MARKER_CROSS, int(28 * k), thick)
+        for x, y in sv.palms:
+            cv2.circle(img, (int(x * w), int(y * h)), int(12 * k), YELLOW, -1, cv2.LINE_AA)
+        # Instruction panel under the scramble line.
+        scale, lh = 0.62 * k, int(26 * k)
+        lines = [ln for s in sv.lines for ln in _wrap(s, w - int(300 * k), scale, 1)]
+        warn = [ln for s in sv.warnings for ln in _wrap("WARNING: " + s, w - int(300 * k), scale, 1)]
+        x0, y0 = int(240 * k), int(92 * k)
+        bottom = y0 + int(34 * k) + lh * (len(lines) + len(warn)) + (int(18 * k) if sv.progress > 0 else 0)
+        _panel(img, x0 - int(14 * k), y0 - int(8 * k), w - int(30 * k), bottom, alpha=0.75)
+        _text(img, sv.title, (x0, y0 + int(22 * k)), 0.8 * k, CYAN, max(1, int(2 * k)), shadow=False)
+        y = y0 + int(22 * k) + lh
+        for ln in lines:
+            _text(img, ln, (x0, y), scale, WHITE, 1, shadow=False)
+            y += lh
+        for ln in warn:
+            _text(img, ln, (x0, y), scale, ORANGE, max(1, int(2 * k)), shadow=False)
+            y += lh
+        if sv.progress > 0:
+            bar_w = w - int(30 * k) - x0 - int(14 * k)
+            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + bar_w, y), GREY, 1)
+            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + int(bar_w * sv.progress), y), YELLOW, -1)
 
     def _scramble(self, img, vm: ViewModel, k: float) -> None:
         if not vm.scramble:

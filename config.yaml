@@ -19,12 +19,21 @@ detection:
   min_tracking_confidence: 0.5
   process_width: 640   # frames are downscaled to this width for detection (speed)
 
-# Start zone ("virtual stackmat") as fractions of the frame: x, y = top-left corner.
+# Start zone ("virtual stackmat"): a polygon in fractions of the displayed frame
+# (0,0 = top-left, 1,1 = bottom-right). Set it in the app with M (drag a
+# rectangle, rest your hands, or use 4 printed markers); M saves it here.
+# Old configs with x / y / w / h (a rectangle) still work.
 zone:
-  x: 0.10
-  y: 0.68
-  w: 0.80
-  h: 0.30
+  mode: fixed       # fixed = use these points; markers = follow the 4 ArUco markers
+  points: [[0.1, 0.68], [0.9, 0.68], [0.9, 0.98], [0.1, 0.98]]
+
+# Marker mode (tools/make_markers.py prints them). Detection runs in a
+# background thread every `interval` seconds on a frame scaled to process_width.
+markers:
+  dictionary: DICT_4X4_50
+  ids: [0, 1, 2, 3]
+  interval: 0.25
+  process_width: 960
 
 timer:
   hold_time: 0.3       # seconds hands must rest in the zone to arm the timer

@@ -5,3 +5,5 @@ models/
 solves.json
 solves.*.json
 *.tmp
+markers.pdf
+markers.png

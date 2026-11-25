@@ -17,8 +17,8 @@ import cv2
 import numpy as np
 
 from camera import Camera
-from config import load_config
-from detection import DetectorUnavailable, NullDetector, TriggerSample, Zone
+from config import DEFAULTS, load_config, save_zone
+from detection import DetectorUnavailable, NullDetector, TriggerSample
 from keyinput import SpaceKey
 from models import Penalty, Solve, format_solve, format_time
 from scramble import generate_scramble
@@ -26,6 +26,8 @@ from stats import compute_stats
 from storage import SolveStore
 from timer_state import EventType, State, TimerConfig, TimerStateMachine
 from ui import GREEN, ORANGE, RED, WHITE, YELLOW, Renderer, ViewModel
+from zone import Zone, zone_warnings
+from zone_setup import SetupMode, ZoneSetup
 
 BASE = Path(__file__).resolve().parent
 
@@ -83,7 +85,21 @@ class App:
         self.audio = bool(t["audio"])
         self.window = str(c["ui"]["window_name"])
         self.show_debug = bool(c["ui"]["show_debug"])
-        self.zone = Zone(**{k: float(c["zone"][k]) for k in ("x", "y", "w", "h")})
+        self.config_path = Path(config_path)
+        zone_msgs: list[str] = []
+        try:
+            self.zone = Zone.from_config(c["zone"])
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            self.zone = Zone.from_config(DEFAULTS["zone"])
+            zone_msgs.append(f"Zone in config is invalid ({exc}) - using the default zone")
+        self.zone_mode = str(c["zone"].get("mode", "fixed"))
+        if self.zone_mode not in ("fixed", "markers"):
+            zone_msgs.append(f"Unknown zone mode {self.zone_mode!r} - using fixed")
+            self.zone_mode = "fixed"
+        self.markers = None          # MarkerWorker while marker mode (or its setup) is on
+        self.setup: ZoneSetup | None = None
+        self._canvas = (0, 0)
+        self._zone_warn_cache: tuple[Zone | None, list[str]] = (None, [])
         self.store = SolveStore(_resolve(c["storage"]["path"]))
         self.solves: list[Solve] = self.store.load()
         self.scramble = generate_scramble()
@@ -99,8 +115,9 @@ class App:
         self._flash_until = 0.0
         self._last_sample = TriggerSample(0.0, False)
 
-        startup_msgs = [m for m in (cfg_warning, self.store.warning) if m]
+        startup_msgs = [m for m in (cfg_warning, self.store.warning) if m] + zone_msgs
         startup_msgs += self._setup_camera(force_no_camera)
+        startup_msgs += self._setup_zone()
         if self.solves:
             startup_msgs.append(f"Loaded {len(self.solves)} solves from {self.store.path.name}")
         if startup_msgs:
@@ -129,6 +146,89 @@ class App:
         except ImportError as exc:
             return [f"Hand tracking unavailable ({exc}). Camera shown, use SPACE to time."]
         return []
+
+    def _setup_zone(self) -> list[str]:
+        from markers import aruco_available
+
+        msgs = []
+        self.setup = ZoneSetup(hands_available=self.hand_mode,
+                               markers_available=self.camera is not None and aruco_available())
+        if self.zone_mode == "markers":
+            if self.camera is None:
+                msgs.append("Zone mode is 'markers' but there is no camera - using the saved zone")
+            elif not aruco_available():
+                msgs.append("Zone mode is 'markers' but OpenCV has no aruco module "
+                            "(install opencv-contrib-python) - using the saved zone")
+            else:
+                self._start_markers()
+        msgs += [f"{w}. Press M to set up the zone." for w in zone_warnings(self.zone)]
+        return msgs
+
+    # ------------------------------------------------------------------- zone
+    def set_zone(self, zone: Zone) -> None:
+        self.zone = zone
+        if hasattr(self.detector, "zone"):
+            self.detector.zone = zone
+
+    def _start_markers(self) -> None:
+        if self.markers is None:
+            from markers import MarkerWorker
+
+            self.markers = MarkerWorker(self.cfg.get("markers"), mirror=self.mirror)
+
+    def _stop_markers(self) -> None:
+        if self.markers is not None:
+            self.markers.close()
+            self.markers = None
+
+    def zone_warnings(self) -> list[str]:
+        if self._zone_warn_cache[0] is not self.zone:
+            self._zone_warn_cache = (self.zone, zone_warnings(self.zone))
+        return self._zone_warn_cache[1]
+
+    def start_zone_setup(self) -> None:
+        if self.camera is None or not self.camera.alive:
+            self.say("Zone setup needs the camera")
+            return
+        self.setup.start(SetupMode.DRAG)
+
+    def _setup_key(self, key: int, ch: str) -> None:
+        """Keys while the zone setup is open (everything except Q and H comes here)."""
+        setup = self.setup
+        code = key & 0xFF
+        if code == 27:
+            setup.cancel()
+            self.say("Zone setup cancelled - zone unchanged")
+        elif code in (10, 13):
+            result = setup.accept()
+            if result is None:
+                self.say("Not all 4 markers seen yet" if setup.mode is SetupMode.MARKERS else "No zone yet")
+                return
+            mode, zone = result
+            self.zone_mode = mode
+            self.set_zone(zone)
+            try:
+                save_zone(self.config_path, mode, zone.to_config())
+                saved = f"saved to {self.config_path.name}"
+            except (OSError, ValueError) as exc:
+                saved = f"NOT saved ({exc})"
+            warn = zone_warnings(zone)
+            self.say(f"Zone set ({'follows the markers' if mode == 'markers' else mode}), {saved}"
+                     + (f". Warning: {'; '.join(warn)}" if warn else ""), 5.0 if warn else 3.0)
+        elif ch == "m":
+            if setup.cycle() is None:
+                self.say("Zone setup closed - zone unchanged")
+        elif ch == "r":
+            setup.redo()
+        # The marker detector runs only while marker mode is in use or being set up.
+        if setup.active and setup.mode is SetupMode.MARKERS:
+            self._start_markers()
+        elif self.zone_mode != "markers":
+            self._stop_markers()
+
+    def on_mouse(self, event, x, y, flags, param) -> None:
+        if self.setup is not None and self.setup.active:
+            self.setup.on_mouse(event, x, y, *self._canvas)
 
     # ---------------------------------------------------------------- helpers
     def say(self, msg: str, seconds: float = 3.0) -> None:
@@ -188,6 +288,15 @@ class App:
         busy = self.machine.state in (State.SOLVING, State.INSPECTION, State.READY)
         if ch == "q":
             return False
+        if self.setup is not None and self.setup.active and ch != "h":
+            self._setup_key(key, ch)
+            return True
+        if ch == "m":
+            if busy:
+                self.say("Finish or abort (ESC) the current solve first")
+            else:
+                self.start_zone_setup()
+            return True
         if key & 0xFF == 27:
             self.handle_events(self.machine.abort(t))
         elif ch in ("2", "d") or key & 0xFF in (8, 127):
@@ -274,11 +383,23 @@ class App:
             )
         else:
             status.append(f"Keyboard mode | loop {eff:.0f} Hz | timing resolution {res}")
+        zone_txt = "markers" if self.zone_mode == "markers" else ("rectangle" if self.zone.is_rect else "polygon")
+        if self.markers is not None and self.zone_mode == "markers":
+            zone_txt += f" ({self.markers.snapshot()[1]})"
         status.append(
-            f"State {st.value} | inspection {'ON' if m.config.inspection_enabled else 'OFF'} | "
+            f"Zone: {zone_txt} | State {st.value} | inspection {'ON' if m.config.inspection_enabled else 'OFF'} | "
             f"trigger: {'hands' if self.hand_mode else ''}{' + ' if self.hand_mode else ''}SPACE"
             f"{'' if self.space.polled else ' (tap toggles)'}"
         )
+
+        zone_warn = self.zone_warnings()
+        if zone_warn:
+            status.append("ZONE WARNING: " + "; ".join(zone_warn) + " - press M to set up the zone")
+        if self.markers is not None and self.markers.error:
+            status.append(f"Marker detection error: {self.markers.error}")
+        setup_view = self.setup.view() if self.setup is not None else None
+        if setup_view is not None:
+            zone_mode = "setup"
 
         debug = {
             "state": st.value,
@@ -292,6 +413,8 @@ class App:
             debug["palms in zone"] = sum(sample.debug["palms_in_zone"])
             debug["detect ms"] = f"{sample.debug['detect_ms']:.1f}"
             debug.update({k: sample.debug[k] for k in ("hands", "palms", "palms_in_zone")})
+        if self.markers is not None:
+            debug["marker ms"] = f"{self.markers.detect_ms:.1f}"
 
         stats = compute_stats(self.solves)
         return ViewModel(
@@ -310,6 +433,8 @@ class App:
             flash=self._flash_color if now < self._flash_until else None,
             show_debug=self.show_debug,
             debug=debug,
+            setup=setup_view,
+            zone_warning=bool(zone_warn),
         )
 
     # ------------------------------------------------------------------- loop
@@ -321,6 +446,7 @@ class App:
         else:
             canvas_size = tuple(int(v) for v in self.cfg["ui"]["keyboard_canvas"])
             cv2.resizeWindow(self.window, *canvas_size)
+        cv2.setMouseCallback(self.window, self.on_mouse)
         last_seq = 0
         shown = False
         try:
@@ -334,6 +460,7 @@ class App:
                     last_seq = frame.seq
                     t = frame.t
                     img = cv2.flip(frame.image, 1) if self.mirror else frame.image.copy()
+                    self._update_markers(frame.image, t)
                     try:
                         sample = self.detector.process(img, t)
                     except Exception as exc:  # never let detection kill the timer
@@ -349,8 +476,14 @@ class App:
                     sample = TriggerSample(t, False)
 
                 self.loop_rate.tick(t)
+                self._canvas = (img.shape[1], img.shape[0])
                 space_down = self.space.is_down()
-                self.handle_events(self.machine.update(t, sample.active or space_down))
+                trigger = sample.active or space_down
+                if self.setup is not None and self.setup.active:
+                    # Resting your hands to set the zone must not arm the timer.
+                    self._update_setup(t, sample)
+                    trigger = False
+                self.handle_events(self.machine.update(t, trigger))
                 vm = self.build_view(t, sample, space_down, img.shape[1])
                 cv2.imshow(self.window, self.renderer.render(img, vm))
                 shown = True
@@ -361,7 +494,25 @@ class App:
         finally:
             self.close()
 
+    def _update_markers(self, raw_image, t: float) -> None:
+        """Marker mode: hand the raw frame to the worker (O(1)) and pick up its latest zone."""
+        if self.markers is None:
+            return
+        self.markers.submit(raw_image, t)
+        if self.zone_mode == "markers":
+            zone = self.markers.snapshot()[0]
+            if zone is not None and zone != self.zone:
+                self.set_zone(zone)
+
+    def _update_setup(self, t: float, sample: TriggerSample) -> None:
+        if self.markers is not None:
+            zone, status, seen = self.markers.snapshot()
+        else:
+            zone, status, seen = None, "", {}
+        self.setup.update(t, sample.debug.get("hands", []), zone, status, list(seen.values()))
+
     def close(self) -> None:
+        self._stop_markers()
         if self.camera is not None:
             self.camera.close()
         self.detector.close()

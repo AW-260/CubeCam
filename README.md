@@ -48,13 +48,81 @@ other OSes OpenCV can't see key releases, so each press *toggles* the held state
 ### Keys
 `SPACE` timer · `2` toggle +2 on last solve · `D` toggle DNF · `Backspace` delete
 last solve · `I` toggle inspection · `N` new scramble · `H` debug overlay ·
-`Esc` abort current solve (not recorded) · `Q` quit
+`M` start-zone setup (see below) · `Esc` abort current solve (not recorded) · `Q` quit
+
+## Setting up the start zone ("mat")
+
+The start zone is where you rest your hands. A hand counts as "in the zone" when
+its **palm centre** (the average of the wrist and the four knuckles) is inside the
+zone. The zone can be any polygon, not just a rectangle. Hold time and debounce
+work exactly as before; only the inside/outside test changed.
+
+### Camera angle first
+The camera must **see the desk area where your hands rest**, not just you. Tilt it
+down (or put it higher, looking down at the desk) until the mat is in the lower
+half of the picture with some room around it. Your hands must stay visible while
+they rest, so don't let the timer window or a laptop lid cut them off. Even light
+from the front helps the hand tracker. If you move the camera later, set the zone
+again, or use marker mode, which follows the mat.
+
+### Three ways to set it
+Press `M` while the timer is idle. `M` again moves to the next mode. `Enter`
+accepts the zone shown and saves it to `config.yaml` (it persists across
+restarts). `R` starts the current mode over. `Esc` cancels and keeps the old zone.
+While the setup is open the timer ignores your hands, so resting them there
+can't arm it.
+
+1. **Drag** (`M`): click and drag a rectangle over the area where you rest your
+   hands, then press `Enter`. Drag again to redo it.
+2. **Hands** (`M` `M`): rest both hands where you want the mat, as you would
+   before a solve, and hold still. A bar fills over about 2 s; if a hand moves
+   more than about 3 % of the frame width, or isn't seen for more than a quarter
+   of a second, it starts again. The zone is a rectangle around both whole hands
+   plus a margin of about 0.6 x your palm size on each side, so your palms are
+   still inside when you put your hands down slightly differently next time.
+   Check it and press `Enter`.
+3. **Markers** (`M` `M` `M`, optional): use 4 printed markers at the corners of a
+   physical mat. The zone is the shape through the marker centres, so it can be
+   a trapezoid if the camera looks at the desk at an angle.
+   * Run `python tools/make_markers.py`. It writes `markers.pdf` and `markers.png`,
+     an A4 page with the 4 markers (60 mm; `--size 40`..`85` to change), cut lines,
+     instructions and a 50 mm scale bar.
+   * Print at **100 % / actual size**, cut the markers out with their white border,
+     and tape them flat at the 4 corners of the mat. Any marker can go at any
+     corner, either way up.
+   * In marker mode, wait for "4/4 markers" and press `Enter`.
+   * The markers are re-detected about 4 times per second in a background thread
+     (it never slows the timer). If the camera is bumped, the zone moves with
+     the mat. If one marker is hidden under a hand, its position is estimated
+     from the other three. If more are hidden, the last known zone is kept. The
+     status bar shows `Zone: markers (4/4 markers)` and so on.
+   * The saved points are used at startup until the markers are seen again.
+     Choosing a drag or hands zone switches marker mode off.
+
+**Warnings.** If a zone is mostly outside the camera picture (less than half of it
+visible) or too small (under 2 % of the frame, or narrower than 12 % of its
+width), the setup shows it in orange with a warning before you accept. An active
+zone with that problem also shows an orange outline and a "ZONE WARNING" line in
+the status bar.
 
 ## Configuration (`config.yaml`)
 
-The main settings are the zone position and size (fractions of the frame), camera
-index, resolution and requested FPS, hold time, debounce, and inspection on/off.
-Missing keys fall back to the defaults in `config.py`. Solves are saved to
+The main settings are the zone, camera index, resolution and requested FPS, hold
+time, debounce, and inspection on/off.
+Missing keys fall back to the defaults in `config.py`.
+The zone is stored as
+
+```yaml
+zone:
+  mode: fixed       # fixed = use these points; markers = follow the 4 ArUco markers
+  points: [[0.1, 0.68], [0.9, 0.68], [0.9, 0.98], [0.1, 0.98]]
+```
+
+in fractions of the displayed (mirrored) picture, with 0,0 at the top left. `M`
+rewrites only this block and keeps the rest of the file and its comments. Older
+configs with `x`, `y`, `w`, `h` still load as a rectangle. The `markers:`
+section sets the ArUco dictionary and ids (`DICT_4X4_50`, ids 0-3), how often
+they are detected, and at what resolution. Solves are saved to
 `solves.json` (time, penalty, scramble, timestamp, measured FPS, inspection time)
 and reloaded on startup.
 
@@ -92,8 +160,12 @@ keeps showing the camera and stays usable with the spacebar.
 |---|---|
 | `main.py` | App loop: wires camera → detector → state machine → UI, keys, saving |
 | `camera.py` | Threaded capture with per-frame timestamps, measured FPS |
-| `detection.py` | `TriggerDetector` interface, `Zone`, `NullDetector`, `CombinedDetector` |
-| `hands.py` | `HandZoneDetector`: MediaPipe → "≥2 palms in zone" per frame |
+| `detection.py` | `TriggerDetector` interface, `NullDetector`, `CombinedDetector` |
+| `hands.py` | `HandZoneDetector`: MediaPipe → "≥2 palm centres inside the zone polygon" per frame |
+| `zone.py` | Zone polygon (inside test, clipping, warnings) and the hands-mode zone builder |
+| `zone_setup.py` | `M` setup modes: drag, hands, markers (pure logic, drawn by `ui.py`) |
+| `markers.py` | ArUco marker detection in a background thread → zone that follows the mat |
+| `tools/make_markers.py` | Printable A4 PDF/PNG of the 4 markers with instructions |
 | `timer_state.py` | Pure state machine (no OpenCV, no clock) fed `(timestamp, active)` samples |
 | `stats.py` | best, mo3, ao5, ao12, mean (WCA rules: trim best/worst, DNF = worst) |
 | `scramble.py` | 20-move random-move scrambles (no `R R'`, no `R L R`) |
@@ -115,4 +187,15 @@ python -m pytest -q
 
 They cover the state machine (synthetic 60 fps frame streams with flicker, debounce
 bias, inspection +2/DNF boundaries, warnings and abort), stats (ao5/ao12 with DNFs
-and +2), scrambles and storage.
+and +2), scrambles and storage. `tests/test_zone.py` covers the zone:
+* **Geometry:** rectangles, concave and slanted polygons, edges, clipping to the
+  frame, the "mostly outside" and "too small" warnings, and old vs new config formats.
+* **Hands-mode builder:** it needs 2 s of stillness, restarts on movement or slow
+  drift, forgives a brief dropout, ignores a third hand, and the margin covers
+  both hands.
+* **Setup modes and detector:** drag, hands and marker setup flows, and the
+  detector using the palm centre inside a trapezoid.
+* **Markers:** detected in a synthetic perspective desk scene (mirrored and not),
+  the estimated 4th marker and the hold when markers are covered, and the printed
+  sheet is detectable with a well-formed PDF.
+* **Saving the zone:** comments and other settings in `config.yaml` are kept.

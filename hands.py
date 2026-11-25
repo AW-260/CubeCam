@@ -15,13 +15,13 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from detection import DetectorUnavailable, TriggerSample, Zone
+from detection import DetectorUnavailable, TriggerSample
+from zone import PALM_IDS, Zone
 
 # Quieten MediaPipe / TFLite logging (must be set before importing mediapipe).
 os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-PALM_IDS = (0, 5, 9, 13, 17)  # wrist + finger MCP joints
 HAND_CONNECTIONS = (
     (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
     (5, 9), (9, 10), (10, 11), (11, 12), (9, 13), (13, 14), (14, 15), (15, 16),
@@ -109,7 +109,10 @@ def _create_backend(cfg: dict):
 
 
 class HandZoneDetector:
-    """TriggerDetector: active when >= hands_required palm centres are in the zone."""
+    """TriggerDetector: active when >= hands_required palm centres are inside the zone polygon.
+
+    `zone` may be swapped at any time (zone setup, marker mode); the next frame uses it.
+    """
 
     name = "hands"
 
