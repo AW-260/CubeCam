@@ -5,4 +5,5 @@ mediapipe==0.10.21
 opencv-contrib-python==4.11.0.86
 numpy==1.26.4
 PyYAML==6.0.2
+Pillow==13.0.0      # TrueType text in the UI
 pytest==8.3.4

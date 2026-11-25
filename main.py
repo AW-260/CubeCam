@@ -28,11 +28,14 @@ from storage import SolveStore
 from timer_state import EventType, State, TimerConfig, TimerStateMachine
 from plane import TablePlane
 from table_calib import CalibMode, TableCalibration
+from theme import TOAST_FADE_S
 from ui import GREEN, ORANGE, RED, WHITE, YELLOW, ArView, Renderer, ViewModel
 from zone import Zone, zone_warnings
 from zone_setup import ROTATE_STEP, SetupMode, ZoneSetup
 
 BASE = Path(__file__).resolve().parent
+# F1 as reported by cv2.waitKeyEx (Windows, GTK, Qt/macOS)
+F1_KEYS = {0x700000, 0xFFBE, 0x10FFBE, 0xF704}
 
 
 class RateMeter:
@@ -88,6 +91,9 @@ class App:
         self.audio = bool(t["audio"])
         self.window = str(c["ui"]["window_name"])
         self.show_debug = bool(c["ui"]["show_debug"])
+        self.show_help = False
+        self._message_start = 0.0
+        self._flash_start = 0.0
         self.config_path = Path(config_path)
         zone_msgs: list[str] = []
         try:
@@ -443,7 +449,8 @@ class App:
     # ---------------------------------------------------------------- helpers
     def say(self, msg: str, seconds: float = 3.0) -> None:
         self._message = msg
-        self._message_until = time.perf_counter() + seconds
+        self._message_start = time.perf_counter()
+        self._message_until = self._message_start + seconds
 
     @property
     def hand_mode(self) -> bool:
@@ -459,7 +466,8 @@ class App:
             if e.type == EventType.INSPECTION_WARNING:
                 sec = int(e.data)
                 self._flash_color = ORANGE if sec < 12 else RED
-                self._flash_until = time.perf_counter() + 0.7
+                self._flash_start = time.perf_counter()
+                self._flash_until = self._flash_start + 0.7
                 self.say(f"{sec} SECONDS!", 1.5)
                 if self.audio:
                     beep(880 if sec < 12 else 1320, 150 if sec < 12 else 300)
@@ -494,7 +502,10 @@ class App:
             return True
         if self.space.on_key(key):
             return True
-        ch = chr(key & 0xFF).lower() if 0 <= (key & 0xFF) < 128 else ""
+        if key in F1_KEYS or key & 0xFF == ord("?"):
+            self.show_help = not self.show_help
+            return True
+        ch = chr(key & 0xFF).lower() if 0 <= (key & 0xFF) < 128 and key < 0x10000 else ""
         busy = self.machine.state in (State.SOLVING, State.INSPECTION, State.READY)
         if ch == "q":
             return False
@@ -568,9 +579,9 @@ class App:
             else:
                 text = "DNF"
             color = RED if el >= cfg.warnings[-1] else ORANGE if el >= cfg.warnings[0] else WHITE
-            sub = "inspection - rest hands in zone to arm"
+            sub = "Inspection — rest your hands to arm"
             if st == State.READY:
-                color, sub = GREEN, "READY - lift to start"
+                color, sub = GREEN, "Ready — lift to start"
             elif m.hold_progress(t) > 0:
                 color = YELLOW
         elif st == State.SOLVING:
@@ -579,7 +590,7 @@ class App:
             text = format_solve(self.solves[-1]) if self.solves else "0.00"
             if st == State.READY:
                 color = GREEN
-                sub = "lift to start inspection" if m.config.inspection_enabled else "READY - lift to start"
+                sub = "Lift to start inspection" if m.config.inspection_enabled else "Ready — lift to start"
             elif m.hold_progress(t) > 0:
                 color = YELLOW
         if not self.hand_mode:
@@ -615,10 +626,10 @@ class App:
         )
 
         zone_warn = self.zone_warnings()
-        if zone_warn:
-            status.append("ZONE WARNING: " + "; ".join(zone_warn) + " - press M to set up the zone")
+        warnings = [f"{w_} - press M to set the zone up again" for w_ in zone_warn]
         if self.markers is not None and self.markers.error:
-            status.append(f"Marker detection error: {self.markers.error}")
+            warnings.append(f"Marker detection error: {self.markers.error}")
+        status += warnings
         setup_view = self.setup.view() if self.setup is not None else None
         calib_view = self.calib.view()
         if setup_view is not None or calib_view is not None:
@@ -658,8 +669,13 @@ class App:
             hold_progress=m.hold_progress(t),
             status_lines=status,
             message=self._message if now < self._message_until else None,
+            message_alpha=min(1.0, (self._message_until - now) / TOAST_FADE_S,
+                              (now - self._message_start) / 0.12 + 0.2),
             flash=self._flash_color if now < self._flash_until else None,
+            flash_level=max(0.0, (self._flash_until - now) / max(1e-6, self._flash_until - self._flash_start)),
             show_debug=self.show_debug,
+            show_help=self.show_help,
+            warnings=warnings,
             debug=debug,
             setup=setup_view,
             zone_warning=bool(zone_warn),
@@ -684,7 +700,7 @@ class App:
                 if self.camera is not None and self.camera.alive:
                     frame = self.camera.wait_new(last_seq, timeout=0.05)
                     if frame is None:
-                        if not self.handle_key(cv2.waitKey(1), self.machine._last_t or time.perf_counter()):
+                        if not self.handle_key(cv2.waitKeyEx(1), self.machine._last_t or time.perf_counter()):
                             break
                         continue
                     last_seq = frame.seq
@@ -720,7 +736,7 @@ class App:
                 vm = self.build_view(t, sample, space_down, img.shape[1])
                 cv2.imshow(self.window, self.renderer.render(img, vm))
                 shown = True
-                if not self.handle_key(cv2.waitKey(1), t):
+                if not self.handle_key(cv2.waitKeyEx(1), t):
                     break
                 if shown and cv2.getWindowProperty(self.window, cv2.WND_PROP_VISIBLE) < 1:
                     break

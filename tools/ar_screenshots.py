@@ -1,6 +1,6 @@
 """Render screenshots of the AR start mat on a synthetic table (no camera needed).
 
-    python tools/ar_screenshots.py                 # -> docs/screenshots/ar_mat/*.jpg
+    python tools/ar_screenshots.py                 # -> docs/screenshots/after/*.jpg
 
 It builds a synthetic camera view of a wooden table with a phone showing the
 calibration marker, calibrates the table plane from it exactly like key T
@@ -34,6 +34,8 @@ from ui import GREEN, WHITE, YELLOW, ArView, Renderer, ViewModel  # noqa: E402
 from zone_setup import ZoneSetup  # noqa: E402
 
 W, H = 1280, 720
+NEW_UI = "show_help" in ViewModel.__dataclass_fields__
+READY = "Ready — lift to start" if NEW_UI else "READY - lift to start"
 
 
 def build_scene():
@@ -50,7 +52,7 @@ def build_scene():
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default=str(ROOT / "docs" / "screenshots" / "ar_mat"))
+    ap.add_argument("--out", default=str(ROOT / "docs" / "screenshots" / "after"))
     args = ap.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -80,13 +82,16 @@ def main(argv=None) -> int:
     solves = [Solve(t, Penalty.OK, "", "", 30.0, None) for t in (61.42, 58.07, 64.9, 55.31, 59.88, 62.2)]
     stats = compute_stats(solves)
     recent = [format_solve(s) for s in solves[-5:]]
-    renderer = Renderer()
+    try:
+        renderer = Renderer(animate=False)      # stills: no cross-fades
+    except TypeError:                           # older ui.Renderer (before/after comparisons)
+        renderer = Renderer()
     renderer.ar.draw(view.copy(), quad, (mat.width_cm, mat.height_cm))  # learn the table, prepare states
     renderer.ar.wait_idle()
 
     def shot(name, img, state, time_text, color, sub, zone_mode, progress=0.0, ar=True, hands_px=(),
-             calib_v=None, setup_v=None, status=""):
-        vm = ViewModel(
+             calib_v=None, setup_v=None, status="", **extra):
+        vm = ViewModel(**extra,
             state=state, time_text=time_text, time_color=color, sub_text=sub,
             scramble="R U2 F' L D2 B R' U F2 L2 D' R2 B2 U' F L' D R2 U2 B'", stats=stats, recent=recent,
             zone=zone, zone_mode=zone_mode, hold_progress=progress,
@@ -102,15 +107,19 @@ def main(argv=None) -> int:
 
     shot("1_idle.jpg", view, State.IDLE, "59.88", WHITE, "", "idle")
     shot("2_holding.jpg", with_hands, State.IDLE, "59.88", YELLOW, "", "holding", 0.55, hands_px=hands)
-    shot("3_ready.jpg", with_hands, State.READY, "59.88", GREEN, "READY - lift to start", "ready", hands_px=hands)
+    shot("3_ready.jpg", with_hands, State.READY, "59.88", GREEN, READY, "ready", hands_px=hands)
     shot("4_solving.jpg", view, State.SOLVING, "23.41", WHITE, "", "solving")
-    shot("5_ar_off.jpg", with_hands, State.READY, "59.88", GREEN, "READY - lift to start", "ready", ar=False)
+    shot("5_ar_off.jpg", with_hands, State.READY, "59.88", GREEN, READY, "ready", ar=False)
     # calibration screen: show it on the plain view, with the phone outlined and the 10 cm grid
     shot("6_calibration.jpg", view, State.IDLE, "59.88", WHITE, "", "setup", ar=False, calib_v=calib_view)
     # mat placement screen
     setup = ZoneSetup()
     setup.start(plane=plane, mat_size=(30, 22), current_mat=mat)
     shot("7_place_mat.jpg", view, State.IDLE, "59.88", WHITE, "", "setup", setup_v=setup.view())
+    if NEW_UI:
+        shot("8_help.jpg", view, State.IDLE, "59.88", WHITE, "", "idle", show_help=True)
+        shot("9_plain_zone_holding.jpg", with_hands, State.IDLE, "59.88", YELLOW, "", "holding", 0.55, ar=False,
+             message="Zone set (fixed), saved to config.yaml")
     renderer.close()
     return 0
 

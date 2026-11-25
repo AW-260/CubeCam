@@ -1,36 +1,57 @@
-"""OpenCV rendering. Pure drawing: main.py builds a ViewModel, ui draws it."""
+"""Rendering. Pure drawing: main.py builds a ViewModel, ui draws it over the camera picture.
+
+Layout (720p reference, scaled with the frame):
+  * top centre: the scramble in a rounded panel
+  * left column: a compact session-stats panel
+  * centre: the big timer (TrueType digits with a soft shadow), a state line under it
+  * top stack under the scramble: setup / calibration instructions, then messages
+  * right column: a small "? help" hint, warnings, the H debug panel
+  * the bottom of the picture is left free for the mat; keys and status live in
+    the help card (? or F1)
+
+Text is TrueType (gfx.py); colours and sizes come from theme.py, shared with the AR mat.
+State colours cross-fade instead of switching, and messages fade out.
+"""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
 import numpy as np
 
+import theme as T
 from ar_mat import ArMatRenderer
+from gfx import (blend_mask, draw_text, fill_poly, line_height, panel, rounded_mask, rounded_ring, text_width,
+                 wrap)
 from hands import HAND_CONNECTIONS
 from models import format_time
 from stats import SessionStats
+from table_calib import CalibView
 from timer_state import State
 from zone import Zone
-from table_calib import CalibView
 from zone_setup import SetupView
 
-FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_BOLD = cv2.FONT_HERSHEY_DUPLEX
+# Timer colours used by main.py (names kept from before; values from the shared palette)
+WHITE = T.TEXT
+GREY = T.TEXT_MUTED
+YELLOW = T.STATE["holding"]
+GREEN = T.STATE["ready"]
+ORANGE = T.WARN
+RED = T.DANGER
+CYAN = T.ACCENT
 
-# BGR colours
-WHITE = (255, 255, 255)
-GREY = (170, 170, 170)
-DARK = (25, 25, 25)
-GREEN = (80, 220, 80)
-YELLOW = (40, 210, 255)
-ORANGE = (0, 150, 255)
-RED = (60, 60, 240)
-CYAN = (230, 200, 60)
-
-HELP = ("SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  M zone/mat  T table  A AR mat  "
-        "H debug  ESC abort  Q quit")
+HELP_KEYS = [
+    ("Space", "start / stop (keyboard)"), ("Esc", "abort the solve"),
+    ("2", "+2 on last solve"), ("D", "DNF on last solve"),
+    ("Backspace", "delete last solve"), ("N", "new scramble"),
+    ("I", "inspection on / off"), ("M", "zone / mat setup"),
+    ("T", "table calibration"), ("A", "AR mat look on / off"),
+    ("H", "debug overlay"), ("? / F1", "this help"),
+    ("Q", "quit"), ("", ""),
+]
+HELP = "  ".join(f"{k} {v}" for k, v in HELP_KEYS if k)   # one-line version (kept for reference)
 
 
 @dataclass
@@ -49,80 +70,60 @@ class ViewModel:
     state: State
     time_text: str
     time_color: tuple = WHITE
-    sub_text: str = ""                       # e.g. "+2", "inspection 9.1s"
+    sub_text: str = ""                       # e.g. "READY - lift to start"
     scramble: str = ""
     stats: SessionStats | None = None
     recent: list[str] = field(default_factory=list)
     zone: Zone | None = None
     zone_mode: str = "idle"                  # idle | holding | ready | solving | setup | off
     hold_progress: float = 0.0
-    status_lines: list[str] = field(default_factory=list)
+    status_lines: list[str] = field(default_factory=list)   # shown in the help card
     message: str | None = None
+    message_alpha: float = 1.0               # messages fade out
     flash: tuple | None = None               # border colour for inspection warnings
+    flash_level: float = 1.0                 # 1 -> 0 while it fades
     show_debug: bool = False
+    show_help: bool = False
     debug: dict[str, Any] = field(default_factory=dict)
     setup: SetupView | None = None           # zone setup overlay (key M)
     zone_warning: bool = False               # zone mostly off-screen / too small
+    warnings: list[str] = field(default_factory=list)       # small warning pills (right column)
     calib: CalibView | None = None           # table calibration overlay (key T)
     ar: ArView | None = None                 # AR mat (replaces the flat zone outline)
 
 
-def _text(img, s, org, scale, color=WHITE, thick=1, font=FONT, shadow=True):
-    if shadow:
-        cv2.putText(img, s, (org[0] + 2, org[1] + 2), font, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
-    cv2.putText(img, s, org, font, scale, color, thick, cv2.LINE_AA)
-
-
-def _panel(img, x1, y1, x2, y2, alpha=0.55, color=DARK):
-    h, w = img.shape[:2]
-    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
-    if x2 <= x1 or y2 <= y1:
-        return
-    roi = img[y1:y2, x1:x2]
-    overlay = np.empty_like(roi)
-    overlay[:] = color
-    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
-
-
-def _fill_poly(img, pts: np.ndarray, color, alpha: float) -> None:
-    """Translucent polygon fill (only the polygon's bounding box is blended)."""
-    h, w = img.shape[:2]
-    x1, y1 = max(0, int(pts[:, 0, 0].min())), max(0, int(pts[:, 0, 1].min()))
-    x2, y2 = min(w, int(pts[:, 0, 0].max()) + 1), min(h, int(pts[:, 0, 1].max()) + 1)
-    if x2 <= x1 or y2 <= y1:
-        return
-    roi = img[y1:y2, x1:x2]
-    mask = np.zeros(roi.shape[:2], np.uint8)
-    cv2.fillPoly(mask, [pts - np.array([x1, y1], np.int32)], 255)
-    overlay = roi.copy()
-    overlay[mask > 0] = color
-    cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, dst=roi)
-
-
-def _wrap(s: str, max_w: int, scale: float, thick: int) -> list[str]:
-    lines, cur = [], ""
-    for word in s.split():
-        trial = f"{cur} {word}".strip()
-        if cv2.getTextSize(trial, FONT, scale, thick)[0][0] > max_w and cur:
-            lines.append(cur)
-            cur = word
-        else:
-            cur = trial
-    if cur:
-        lines.append(cur)
-    return lines
-
-
 class Renderer:
-    def __init__(self):
-        self.ar = ArMatRenderer()
+    def __init__(self, animate: bool = True):
+        self.animate = animate
+        self.ar = ArMatRenderer(animate=animate)
+        self._colors: dict[str, tuple] = {}
+        self._last_t: float | None = None
+        self._dt = 0.0
 
     def close(self) -> None:
         self.ar.close()
 
+    # ------------------------------------------------------------- animation
+    def _smooth(self, name: str, target) -> tuple:
+        """Colour that eases towards `target` over ~theme.FADE_S instead of jumping."""
+        target = np.array(target, dtype=np.float64)
+        cur = self._colors.get(name)
+        if cur is None or not self.animate:
+            cur = target
+        else:
+            cur = cur + (target - cur) * min(1.0, self._dt / T.FADE_S * 2.2)
+            if np.abs(target - cur).max() < 0.75:      # close enough: land exactly
+                cur = target
+        self._colors[name] = cur
+        return tuple(int(round(v)) for v in cur)
+
+    # ---------------------------------------------------------------- render
     def render(self, img: np.ndarray, vm: ViewModel) -> np.ndarray:
+        now = time.perf_counter()
+        self._dt = 0.0 if self._last_t is None else min(0.2, now - self._last_t)
+        self._last_t = now
         h, w = img.shape[:2]
-        k = h / 720.0  # scale factor relative to a 720p layout
+        k = h / 720.0
         loupe = None
         if vm.calib is not None and vm.calib.mouse_px is not None:
             loupe = self._loupe_crop(img, vm.calib.mouse_px, k)   # from the clean frame, before overlays
@@ -131,228 +132,392 @@ class Renderer:
             self.ar.draw(img, a.quad, a.size_cm, a.state, a.progress, a.hands_px)
         self._zone(img, vm, k)
         if vm.setup is not None:
-            self._setup(img, vm.setup, k, on_ar=vm.ar is not None)
+            self._setup_marks(img, vm.setup, k, on_ar=vm.ar is not None)
         if vm.calib is not None:
-            self._calib(img, vm.calib, loupe, k)
+            self._calib_marks(img, vm.calib, loupe, k)
         if vm.show_debug:
-            self._debug(img, vm, k)
-        self._scramble(img, vm, k)
-        self._timer(img, vm, k)
-        self._stats(img, vm, k)
-        self._status(img, vm, k)
+            self._debug_marks(img, vm, k)
+
+        y = self._scramble(img, vm, k)
+        side = self._stats(img, vm, k)
+        right_y = self._hint(img, vm, k)
+        if vm.setup is not None:
+            y = self._instructions(img, vm.setup.title, vm.setup.lines, vm.setup.warnings, vm.setup.progress, y, side, k)
+        elif vm.calib is not None:
+            y = self._instructions(img, vm.calib.title, vm.calib.lines, vm.calib.warnings, vm.calib.progress, y, side, k)
+        else:
+            self._timer(img, vm, k)
         if vm.message:
-            self._message(img, vm.message, k)
-        if vm.flash is not None:
-            cv2.rectangle(img, (0, 0), (w - 1, h - 1), vm.flash, max(6, int(14 * k)))
+            y = self._toast(img, vm.message, vm.message_alpha, y, side, k)
+        right_y = self._warnings(img, vm.warnings, max(right_y, y), k)
+        if vm.show_debug:
+            self._debug_panel(img, vm, right_y, k)
+        if vm.flash is not None and vm.flash_level > 0:
+            self._flash(img, vm.flash, vm.flash_level, k)
+        if vm.show_help:
+            self._help(img, vm, k)
         return img
 
-    # ------------------------------------------------------------------ parts
+    # ------------------------------------------------------------- top / side
+    def _side_width(self, k: float) -> int:
+        return int(196 * k)
+
+    def _scramble(self, img, vm: ViewModel, k: float) -> int:
+        """Returns the y just below the panel."""
+        h, w = img.shape[:2]
+        m = int(T.MARGIN * k)
+        if not vm.scramble:
+            return m
+        px = T.SIZE_SCRAMBLE * k
+        pad_x, pad_y = int(T.PAD * 1.4 * k), int(T.PAD * 0.6 * k)
+        max_w = w - 2 * (m + self._side_width(k) + int(T.GAP * k)) - 2 * pad_x
+        lines = wrap(vm.scramble, max_w, int(px), "semibold")
+        lh = line_height("semibold", int(px))
+        tw = max(text_width(s, "semibold", int(px)) for s in lines)
+        pw, ph = tw + 2 * pad_x, lh * len(lines) + 2 * pad_y
+        x0 = (w - pw) // 2
+        panel(img, x0, m, pw, ph, int(T.RADIUS * k), T.PANEL, T.PANEL_ALPHA, T.PANEL_EDGE, T.EDGE_ALPHA)
+        for i, s in enumerate(lines):
+            draw_text(img, s, w / 2, m + pad_y + i * lh, px, T.TEXT, "semibold", "mt")
+        return m + ph + int(T.GAP * k)
+
+    def _stats(self, img, vm: ViewModel, k: float) -> int:
+        """Compact session panel in the left column. Returns the column's right edge."""
+        m = int(T.MARGIN * k)
+        sw = self._side_width(k)
+        if vm.stats is None:
+            return m
+        st = vm.stats
+        rows = [("last", format_time(st.current)), ("best", format_time(st.best)), ("mo3", format_time(st.mo3)),
+                ("ao5", format_time(st.ao5)), ("ao12", format_time(st.ao12)), ("mean", format_time(st.mean))]
+        recent = vm.recent[-5:][::-1]
+        pad = int(T.PAD * k)
+        px, small = T.SIZE_BODY * k, T.SIZE_SMALL * k
+        lh = int(line_height("regular", int(px)) * 1.02)
+        slh = int(line_height("regular", int(small)) * 1.05)
+        title_h = int(line_height("semibold", int(small)) * 1.25)
+        height = pad + title_h + lh * len(rows) + (int(8 * k) + slh * len(recent) if recent else 0) + pad
+        panel(img, m, m, sw, height, int(T.RADIUS * k), T.PANEL, T.PANEL_ALPHA, T.PANEL_EDGE, T.EDGE_ALPHA)
+        x0, x1 = m + pad, m + sw - pad
+        y = m + pad
+        draw_text(img, "SESSION", x0, y, small, T.TEXT_MUTED, "semibold")
+        draw_text(img, f"{st.count - st.dnf_count}/{st.count}", x1, y, small, T.TEXT_MUTED, "regular", "rt")
+        y += title_h
+        for name, val in rows:
+            draw_text(img, name, x0, y, px, T.TEXT_MUTED)
+            draw_text(img, val, x1, y, px, T.TEXT if val != "-" else T.TEXT_FAINT, "semibold", "rt")
+            y += lh
+        if recent:
+            y += int(4 * k)
+            cv2.line(img, (x0, y), (x1, y), T.TEXT_FAINT, 1, cv2.LINE_AA)
+            y += int(4 * k)
+            for j, s in enumerate(recent):
+                draw_text(img, f"{st.count - j}.", x0, y, small, T.TEXT_FAINT)
+                draw_text(img, s, x1, y, small, T.TEXT_MUTED, "regular", "rt")
+                y += slh
+        return m + sw
+
+    def _hint(self, img, vm: ViewModel, k: float) -> int:
+        """Small '? help' pill at the top right. Returns the y below it."""
+        h, w = img.shape[:2]
+        m = int(T.MARGIN * k)
+        px = T.SIZE_SMALL * k
+        label = "?  help" if not vm.show_help else "?  close help"
+        lh = line_height("regular", int(px))
+        pad = int(10 * k)
+        pw = text_width(label, "regular", int(px)) + 2 * pad
+        ph = lh + int(8 * k)
+        panel(img, w - m - pw, m, pw, ph, ph // 2, T.PANEL, T.PANEL_ALPHA * 0.8, T.PANEL_EDGE, T.EDGE_ALPHA)
+        draw_text(img, label, w - m - pw / 2, m + ph / 2, px, T.TEXT_MUTED, "regular", "mm")
+        return m + ph + int(T.GAP * k)
+
+    def _warnings(self, img, warnings: list[str], y: int, k: float) -> int:
+        if not warnings:
+            return y
+        h, w = img.shape[:2]
+        m = int(T.MARGIN * k)
+        px = T.SIZE_SMALL * k
+        pad = int(10 * k)
+        max_w = int(380 * k)
+        lh = line_height("regular", int(px))
+        for msg in warnings:
+            lines = wrap(msg, max_w - 2 * pad - int(14 * k), int(px))
+            tw = max(text_width(s, "regular", int(px)) for s in lines)
+            pw, ph = tw + 2 * pad + int(14 * k), lh * len(lines) + int(10 * k)
+            x0 = w - m - pw
+            panel(img, x0, y, pw, ph, int(10 * k), T.PANEL, 0.78, T.WARN, 0.55)
+            cv2.circle(img, (x0 + pad + int(3 * k), y + ph // 2), max(2, int(4 * k)), T.WARN, -1, cv2.LINE_AA)
+            for i, s in enumerate(lines):
+                draw_text(img, s, x0 + pad + int(14 * k), y + int(5 * k) + i * lh, px, T.TEXT)
+            y += ph + int(6 * k)
+        return y + int(T.GAP * k)
+
+    # ----------------------------------------------------------------- timer
+    def _timer(self, img, vm: ViewModel, k: float) -> None:
+        h, w = img.shape[:2]
+        color = self._smooth("timer", vm.time_color)
+        px = T.SIZE_TIMER * k
+        cy = int(h * 0.40)
+        box = draw_text(img, vm.time_text, w / 2, cy, px, color, "digits", "mm", shadow=0.55)
+        if vm.sub_text:
+            spx = T.SIZE_SUB * k
+            lh = line_height("regular", int(spx))
+            pad = int(12 * k)
+            dot = int(16 * k)
+            tw = text_width(vm.sub_text, "regular", int(spx))
+            pw, ph = tw + 2 * pad + dot, lh + int(8 * k)
+            x0, y0 = int(w / 2 - pw / 2), box[3] - int(4 * k)
+            panel(img, x0, y0, pw, ph, ph // 2, T.PANEL, T.PANEL_ALPHA, T.PANEL_EDGE, T.EDGE_ALPHA)
+            cv2.circle(img, (x0 + pad + int(4 * k), y0 + ph // 2), max(2, int(5 * k)), color, -1, cv2.LINE_AA)
+            draw_text(img, vm.sub_text, x0 + pad + dot, y0 + ph / 2, spx, T.TEXT, "regular", "lm")
+
+    # ------------------------------------------------------------------ zone
     def _zone(self, img, vm: ViewModel, k: float) -> None:
         if vm.zone is None or vm.zone_mode == "off":
             return
         h, w = img.shape[:2]
         pts = vm.zone.to_pixels(w, h)
-        thick = max(2, int(3 * k))
         if vm.zone_mode == "setup":  # current zone, faint, under the setup overlay
             if vm.ar is None:
-                cv2.polylines(img, [pts], True, GREY, 1, cv2.LINE_AA)
+                cv2.polylines(img, [pts], True, T.TEXT_FAINT, 1, cv2.LINE_AA)
             return
         if vm.ar is not None:        # the AR mat shows the state itself
             return
-        color = {"idle": GREY, "holding": YELLOW, "ready": GREEN, "solving": RED}.get(vm.zone_mode, GREY)
+        target = T.STATE.get(vm.zone_mode, T.STATE["idle"])
         if vm.zone_warning and vm.zone_mode == "idle":
-            color = ORANGE
-        if vm.zone_mode in ("ready", "holding"):
-            _fill_poly(img, pts, color, 0.25)
-        cv2.polylines(img, [pts], True, color, thick, cv2.LINE_AA)
-        x1, y1 = int(pts[:, 0, 0].min()), int(pts[:, 0, 1].min())
-        x2, y2 = int(pts[:, 0, 0].max()), int(pts[:, 0, 1].max())
-        # Keep the label and the hold bar on screen even if the zone pokes out of the frame.
-        lx1, lx2 = max(0, x1), min(w, x2)
-        ly1, ly2 = max(0, y1), min(h - 1, y2)
+            target = T.WARN
+        color = self._smooth("zone", target)
+        poly = pts[:, 0, :].astype(np.float64)
+        fill = {"holding": 0.10 + 0.12 * vm.hold_progress, "ready": 0.22}.get(vm.zone_mode, 0.0)
+        if fill:
+            fill_poly(img, poly, color, fill)
+        cv2.polylines(img, [np.int32(np.round(poly * 16))], True, color, max(2, int(2.5 * k)), cv2.LINE_AA, shift=4)
+        # label pill just inside the top edge, centred, with the hold progress in it
+        label = {"idle": "Rest both hands here", "holding": "Hold still",
+                 "ready": "Ready - lift to start", "solving": "Hands back here to stop"}[vm.zone_mode]
+        px = T.SIZE_SMALL * k
+        lh = line_height("semibold", int(px))
+        pad = int(10 * k)
+        pw, ph = text_width(label, "semibold", int(px)) + 2 * pad, lh + int(10 * k)
+        x0 = int(min(max(poly[:, 0].mean() - pw / 2, 0), w - pw))
+        y0 = int(min(max(poly[:, 1].min() + 8 * k, 0), h - ph))
+        panel(img, x0, y0, pw, ph, ph // 2, T.PANEL, T.PANEL_ALPHA, color, 0.6)
         if vm.zone_mode == "holding" and vm.hold_progress > 0:
-            px = lx1 + int((lx2 - lx1) * vm.hold_progress)
-            cv2.rectangle(img, (lx1, ly2 - int(10 * k)), (px, ly2), color, -1)
-        label = {"idle": "START ZONE - rest both hands here", "holding": "hold...",
-                 "ready": "READY - lift to start", "solving": "return hands to stop"}[vm.zone_mode]
-        scale, lthick = 0.7 * k, max(1, int(2 * k))
-        if vm.zone.is_rect:
-            lx = lx1 + int(10 * k)
-        else:  # slanted sides: centre the label so it stays inside the shape
-            tw = cv2.getTextSize(label, FONT, scale, lthick)[0][0]
-            lx = min(max(0, (lx1 + lx2 - tw) // 2), max(0, w - tw))
-        _text(img, label, (lx, ly1 + int(28 * k)), scale, color, lthick)
+            bw = int((pw - 2 * pad) * min(vm.hold_progress, 1.0))
+            if bw > 0:
+                panel(img, x0 + pad, y0 + ph - int(5 * k), bw, max(2, int(3 * k)), int(2 * k), color, 0.95)
+        draw_text(img, label, x0 + pw / 2, y0 + ph / 2 - int(1 * k), px, T.TEXT, "semibold", "mm")
 
-    def _setup(self, img, sv: SetupView, k: float, on_ar: bool = False) -> None:
+    # ---------------------------------------------------------------- setup
+    def _setup_marks(self, img, sv: SetupView, k: float, on_ar: bool = False) -> None:
         h, w = img.shape[:2]
-        thick = max(2, int(3 * k))
+        thick = max(2, int(2.5 * k))
         if sv.candidate is not None:
-            pts = sv.candidate.to_pixels(w, h)
-            color = ORANGE if sv.warnings else CYAN
+            poly = np.array(sv.candidate.points) * (w, h)
+            color = T.WARN if sv.warnings else T.ACCENT
             if not on_ar:                    # the AR mat preview already shows the area
-                _fill_poly(img, pts, color, 0.2)
-            cv2.polylines(img, [pts], True, color, thick, cv2.LINE_AA)
-            for p in pts[:, 0]:
-                cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(6 * k)), color, -1, cv2.LINE_AA)
+                fill_poly(img, poly, color, 0.16)
+            cv2.polylines(img, [np.int32(np.round(poly * 16))], True, color, thick, cv2.LINE_AA, shift=4)
+            for p in poly:
+                cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(5 * k)), color, -1, cv2.LINE_AA)
         if sv.drag is not None:
             (ax, ay), (bx, by) = sv.drag
-            cv2.rectangle(img, (int(ax * w), int(ay * h)), (int(bx * w), int(by * h)), YELLOW, thick)
+            r = np.array([(ax, ay), (bx, ay), (bx, by), (ax, by)]) * (w, h)
+            fill_poly(img, r, T.ACCENT, 0.12)
+            cv2.polylines(img, [np.int32(np.round(r))], True, T.ACCENT, thick, cv2.LINE_AA)
         for x, y in sv.markers:
-            c = (int(x * w), int(y * h))
-            cv2.drawMarker(img, c, GREEN, cv2.MARKER_CROSS, int(28 * k), thick)
+            cv2.drawMarker(img, (int(x * w), int(y * h)), T.STATE["ready"], cv2.MARKER_CROSS, int(26 * k), thick)
         for x, y in sv.palms:
-            cv2.circle(img, (int(x * w), int(y * h)), int(12 * k), YELLOW, -1, cv2.LINE_AA)
-        self._instructions(img, sv.title, sv.lines, sv.warnings, sv.progress, k)
+            cv2.circle(img, (int(x * w), int(y * h)), int(10 * k), T.STATE["holding"], -1, cv2.LINE_AA)
+            cv2.circle(img, (int(x * w), int(y * h)), int(10 * k), T.PANEL, max(1, int(2 * k)), cv2.LINE_AA)
 
     def _instructions(self, img, title: str, lines_in: list[str], warnings: list[str], progress: float,
-                      k: float) -> None:
-        """Instruction panel under the scramble line."""
+                      y: int, side: int, k: float) -> int:
+        """Instruction card in the top stack. Returns the y below it."""
         h, w = img.shape[:2]
-        scale, lh = 0.62 * k, int(26 * k)
-        lines = [ln for s in lines_in for ln in _wrap(s, w - int(300 * k), scale, 1)]
-        warn = [ln for s in warnings for ln in _wrap("WARNING: " + s, w - int(300 * k), scale, 1)]
-        x0, y0 = int(240 * k), int(92 * k)
-        bottom = y0 + int(34 * k) + lh * (len(lines) + len(warn)) + (int(18 * k) if progress > 0 else 0)
-        _panel(img, x0 - int(14 * k), y0 - int(8 * k), w - int(30 * k), bottom, alpha=0.75)
-        _text(img, title, (x0, y0 + int(22 * k)), 0.8 * k, CYAN, max(1, int(2 * k)), shadow=False)
-        y = y0 + int(22 * k) + lh
-        for ln in lines:
-            _text(img, ln, (x0, y), scale, WHITE, 1, shadow=False)
-            y += lh
+        m = int(T.MARGIN * k)
+        x0 = side + int(T.GAP * k)
+        x1 = w - m - self._side_width(k) // 2
+        pad = int(T.PAD * 1.2 * k)
+        px, tpx = T.SIZE_BODY * k, T.SIZE_TITLE * k
+        max_w = x1 - x0 - 2 * pad
+        lines = []
+        for s in lines_in:
+            if "   " in s:     # a key-hint line ("ENTER accept   R redo   ESC cancel"): muted, dot-separated
+                hint = "  ·  ".join(part.strip() for part in s.split("   ") if part.strip())
+                lines += [("hint", ln) for ln in wrap(hint, max_w, int(px))]
+            else:
+                lines += [("text", ln) for ln in wrap(s, max_w, int(px))]
+        warn = [ln for s in warnings for ln in wrap(s, max_w - int(16 * k), int(px))]
+        lh = int(line_height("regular", int(px)) * 1.02)
+        th = int(line_height("semibold", int(tpx)) * 1.15)
+        bar = int(18 * k) if progress > 0 else 0
+        ph = pad + th + lh * (len(lines) + len(warn)) + bar + pad
+        panel(img, x0, y, x1 - x0, ph, int(T.RADIUS * k), T.PANEL, 0.8, T.PANEL_EDGE, T.EDGE_ALPHA)
+        cy = y + pad
+        draw_text(img, title, x0 + pad, cy, tpx, T.ACCENT, "semibold")
+        cy += th
+        for kind, ln in lines:
+            draw_text(img, ln, x0 + pad, cy, px, T.TEXT_MUTED if kind == "hint" else T.TEXT)
+            cy += lh
         for ln in warn:
-            _text(img, ln, (x0, y), scale, ORANGE, max(1, int(2 * k)), shadow=False)
-            y += lh
+            cv2.circle(img, (x0 + pad + int(4 * k), cy + lh // 2), max(2, int(4 * k)), T.WARN, -1, cv2.LINE_AA)
+            draw_text(img, ln, x0 + pad + int(16 * k), cy, px, T.WARN)
+            cy += lh
         if progress > 0:
-            bar_w = w - int(30 * k) - x0 - int(14 * k)
-            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + bar_w, y), GREY, 1)
-            cv2.rectangle(img, (x0, y - int(12 * k)), (x0 + int(bar_w * min(progress, 1.0)), y), YELLOW, -1)
+            bw = x1 - x0 - 2 * pad
+            bh = max(4, int(6 * k))
+            panel(img, x0 + pad, cy + int(6 * k), bw, bh, bh // 2, T.TEXT_FAINT, 0.5)
+            fw = int(bw * min(progress, 1.0))
+            if fw > 1:
+                panel(img, x0 + pad, cy + int(6 * k), fw, bh, bh // 2, T.STATE["holding"], 1.0)
+        return y + ph + int(T.GAP * k)
+
+    def _toast(self, img, msg: str, alpha: float, y: int, side: int, k: float) -> int:
+        h, w = img.shape[:2]
+        px = T.SIZE_BODY * k
+        pad = int(T.PAD * k)
+        max_w = min(int(760 * k), w - 2 * (side + int(T.GAP * k)))
+        lines = wrap(msg, max_w - 2 * pad, int(px))
+        lh = int(line_height("regular", int(px)) * 1.02)
+        tw = max(text_width(s, "regular", int(px)) for s in lines)
+        pw, ph = tw + 2 * pad, lh * len(lines) + int(T.PAD * 1.2 * k)
+        x0 = (w - pw) // 2
+        a = max(0.0, min(1.0, alpha))
+        panel(img, x0, y, pw, ph, int(T.RADIUS * k), T.PANEL, 0.82 * a, T.ACCENT, 0.45 * a)
+        for i, s in enumerate(lines):
+            draw_text(img, s, w / 2, y + int(T.PAD * 0.6 * k) + i * lh, px, T.TEXT, "regular", "mt", opacity=a)
+        return y + ph + int(T.GAP * k)
 
     # ------------------------------------------------------- table calibration
     LOUPE_SRC = 60      # half-size of the magnified area (px, at 720p)
     LOUPE_ZOOM = 3
 
     def _loupe_crop(self, img, mouse, k):
-        h, w = img.shape[:2]
         r = int(self.LOUPE_SRC * k)
         x, y = int(round(mouse[0])), int(round(mouse[1]))
         pad = cv2.copyMakeBorder(img, r, r, r, r, cv2.BORDER_CONSTANT, value=(40, 40, 40))
         return pad[y:y + 2 * r, x:x + 2 * r].copy(), (x - r, y - r)
 
-    def _calib(self, img, cv_: CalibView, loupe, k: float) -> None:
+    def _calib_marks(self, img, cv_: CalibView, loupe, k: float) -> None:
         h, w = img.shape[:2]
-        for line in cv_.grid_px:
-            cv2.polylines(img, [np.int32(np.round(line))], False, CYAN, 1, cv2.LINE_AA)
+        if cv_.grid_px:
+            layer = img.copy()
+            for line in cv_.grid_px:
+                cv2.polylines(layer, [np.int32(np.round(line * 16))], False, T.ACCENT, 1, cv2.LINE_AA, shift=4)
+            cv2.addWeighted(layer, 0.75, img, 0.25, 0, dst=img)
         if cv_.marker_px is not None:
-            cv2.polylines(img, [np.int32(np.round(cv_.marker_px))], True, GREEN, max(2, int(3 * k)), cv2.LINE_AA)
+            mp = np.array(cv_.marker_px, dtype=np.float64)
+            fill_poly(img, mp, T.STATE["ready"], 0.25)
+            cv2.polylines(img, [np.int32(np.round(mp * 16))], True, T.STATE["ready"], max(2, int(2.5 * k)),
+                          cv2.LINE_AA, shift=4)
         clicks = [tuple(map(int, map(round, c))) for c in cv_.clicks_px]
         if len(clicks) > 1:
-            cv2.polylines(img, [np.int32(clicks)], len(clicks) == 4, YELLOW, max(1, int(2 * k)), cv2.LINE_AA)
+            cv2.polylines(img, [np.int32(clicks)], len(clicks) == 4, T.STATE["holding"], max(1, int(2 * k)), cv2.LINE_AA)
         for i, c in enumerate(clicks):
-            cv2.circle(img, c, max(4, int(6 * k)), YELLOW, -1, cv2.LINE_AA)
-            _text(img, str(i + 1), (c[0] + int(8 * k), c[1] - int(8 * k)), 0.7 * k, YELLOW, max(1, int(2 * k)))
+            r = int(11 * k)
+            cv2.circle(img, c, r, T.STATE["holding"], -1, cv2.LINE_AA)
+            draw_text(img, str(i + 1), c[0], c[1], T.SIZE_SMALL * k, T.PANEL, "semibold", "mm")
         if loupe is not None:
             crop, (ox, oy) = loupe
             z = self.LOUPE_ZOOM
             big = cv2.resize(crop, None, fx=z, fy=z, interpolation=cv2.INTER_NEAREST)
             bh, bw = big.shape[:2]
-            for i, c in enumerate(clicks):   # earlier clicks, inside the loupe
+            for c in clicks:   # earlier clicks, inside the loupe
                 q = ((c[0] - ox) * z, (c[1] - oy) * z)
                 if 0 <= q[0] < bw and 0 <= q[1] < bh:
-                    cv2.circle(big, (int(q[0]), int(q[1])), 5, YELLOW, 2, cv2.LINE_AA)
+                    cv2.circle(big, (int(q[0]), int(q[1])), 6, T.STATE["holding"], 2, cv2.LINE_AA)
             cx, cy = bw // 2, bh // 2
-            cv2.line(big, (cx - 14, cy), (cx + 14, cy), RED, 1)
-            cv2.line(big, (cx, cy - 14), (cx, cy + 14), RED, 1)
-            # top-right, or top-left if the mouse is over there
+            cv2.line(big, (cx - 16, cy), (cx - 4, cy), T.DANGER, 2)
+            cv2.line(big, (cx + 4, cy), (cx + 16, cy), T.DANGER, 2)
+            cv2.line(big, (cx, cy - 16), (cx, cy - 4), T.DANGER, 2)
+            cv2.line(big, (cx, cy + 4), (cx, cy + 16), T.DANGER, 2)
             mx = cv_.mouse_px[0]
-            lx = w - bw - int(16 * k) if mx < w * 0.6 else int(16 * k)
-            ly = h - bh - int(90 * k)
-            img[ly:ly + bh, lx:lx + bw] = big
-            cv2.rectangle(img, (lx - 1, ly - 1), (lx + bw, ly + bh), WHITE, 2)
-            _text(img, f"x{z}", (lx + 6, ly + int(22 * k)), 0.6 * k, WHITE, 1)
-        self._instructions(img, cv_.title, cv_.lines, cv_.warnings, cv_.progress, k)
+            m = int(T.MARGIN * k)
+            lx = w - bw - m if mx < w * 0.6 else m
+            ly = h - bh - m
+            # rounded loupe: blend the magnified picture through a rounded mask, then a border
+            rmask = rounded_mask(bw, bh, int(T.RADIUS * k))
+            roi = img[ly:ly + bh, lx:lx + bw]
+            roi[:] = cv2.blendLinear(big, roi, rmask, 1.0 - rmask)
+            blend_mask(img, rounded_ring(bw, bh, int(T.RADIUS * k), 2), lx, ly, T.TEXT, 0.9)
+            draw_text(img, f"{z}x", lx + int(10 * k), ly + int(8 * k), T.SIZE_SMALL * k, T.TEXT, "semibold", shadow=0.8)
 
-    def _scramble(self, img, vm: ViewModel, k: float) -> None:
-        if not vm.scramble:
-            return
-        h, w = img.shape[:2]
-        scale, thick = 0.85 * k, max(1, int(2 * k))
-        lines = _wrap(vm.scramble, w - int(40 * k), scale, thick)
-        line_h = int(36 * k)
-        _panel(img, 0, 0, w, int(14 * k) + line_h * len(lines), alpha=0.6)
-        for i, line in enumerate(lines):
-            tw = cv2.getTextSize(line, FONT, scale, thick)[0][0]
-            _text(img, line, ((w - tw) // 2, int(36 * k) + i * line_h), scale, WHITE, thick)
-
-    def _timer(self, img, vm: ViewModel, k: float) -> None:
-        h, w = img.shape[:2]
-        scale, thick = 3.6 * k, max(2, int(6 * k))
-        (tw, th), _ = cv2.getTextSize(vm.time_text, FONT_BOLD, scale, thick)
-        y = int(h * 0.45)
-        _text(img, vm.time_text, ((w - tw) // 2, y), scale, vm.time_color, thick, FONT_BOLD)
-        if vm.sub_text:
-            s2, t2 = 1.0 * k, max(1, int(2 * k))
-            sw = cv2.getTextSize(vm.sub_text, FONT, s2, t2)[0][0]
-            _text(img, vm.sub_text, ((w - sw) // 2, y + int(50 * k)), s2, vm.time_color, t2)
-
-    def _stats(self, img, vm: ViewModel, k: float) -> None:
-        if vm.stats is None:
-            return
-        st = vm.stats
-        rows = [
-            ("current", format_time(st.current)),
-            ("best", format_time(st.best)),
-            ("mo3", format_time(st.mo3)),
-            ("ao5", format_time(st.ao5)),
-            ("ao12", format_time(st.ao12)),
-            ("mean", format_time(st.mean)),
-            ("solves", f"{st.count - st.dnf_count}/{st.count}"),
-        ]
-        scale, thick, lh = 0.6 * k, 1, int(26 * k)
-        x0, y0 = int(12 * k), int(130 * k)
-        n_recent = min(len(vm.recent), 5)
-        height = lh * (len(rows) + n_recent) + (int(8 * k) if n_recent else 0) + int(16 * k)
-        _panel(img, 0, y0 - int(24 * k), int(215 * k), y0 + height - int(16 * k), alpha=0.55)
-        for i, (name, val) in enumerate(rows):
-            y = y0 + i * lh
-            _text(img, name, (x0, y), scale, GREY, thick, shadow=False)
-            _text(img, val, (x0 + int(90 * k), y), scale, WHITE, thick, shadow=False)
-        y = y0 + len(rows) * lh + int(8 * k)
-        for j, s in enumerate(vm.recent[-5:][::-1]):
-            _text(img, f"{vm.stats.count - j}. {s}", (x0, y + j * lh), 0.55 * k, CYAN, thick, shadow=False)
-
-    def _status(self, img, vm: ViewModel, k: float) -> None:
-        h, w = img.shape[:2]
-        scale, lh = 0.5 * k, int(22 * k)
-        lines = vm.status_lines + [HELP]
-        _panel(img, 0, h - lh * len(lines) - int(10 * k), w, h, alpha=0.6)
-        for i, line in enumerate(lines):
-            _text(img, line, (int(10 * k), h - int(10 * k) - (len(lines) - 1 - i) * lh), scale,
-                  GREY if line is HELP else WHITE, 1, shadow=False)
-
-    def _message(self, img, msg: str, k: float) -> None:
-        h, w = img.shape[:2]
-        scale, thick = 0.7 * k, max(1, int(2 * k))
-        lines = _wrap(msg, w - int(80 * k), scale, thick)
-        lh = int(30 * k)
-        y0 = int(h * 0.58)
-        _panel(img, int(30 * k), y0 - lh, w - int(30 * k), y0 + lh * (len(lines) - 1) + int(14 * k), alpha=0.75)
-        for i, line in enumerate(lines):
-            _text(img, line, (int(45 * k), y0 + i * lh), scale, YELLOW, thick, shadow=False)
-
-    def _debug(self, img, vm: ViewModel, k: float) -> None:
+    # ----------------------------------------------------------------- debug
+    def _debug_marks(self, img, vm: ViewModel, k: float) -> None:
         h, w = img.shape[:2]
         d = vm.debug
         for lm in d.get("hands", []):
             pts = [(int(x * w), int(y * h)) for x, y in lm]
             for a, b in HAND_CONNECTIONS:
-                cv2.line(img, pts[a], pts[b], CYAN, max(1, int(2 * k)), cv2.LINE_AA)
+                cv2.line(img, pts[a], pts[b], T.ACCENT, max(1, int(2 * k)), cv2.LINE_AA)
             for p in pts:
-                cv2.circle(img, p, max(2, int(3 * k)), WHITE, -1, cv2.LINE_AA)
+                cv2.circle(img, p, max(2, int(3 * k)), T.TEXT, -1, cv2.LINE_AA)
         for (px, py), inside in zip(d.get("palms", []), d.get("palms_in_zone", [])):
-            cv2.circle(img, (int(px * w), int(py * h)), int(12 * k), GREEN if inside else RED, -1, cv2.LINE_AA)
-        lines = [f"{key}: {val}" for key, val in d.items() if key not in ("hands", "palms", "palms_in_zone")]
-        x0 = w - int(330 * k)
-        y0 = int(130 * k)
-        _panel(img, x0 - int(10 * k), y0 - int(24 * k), w, y0 + len(lines) * int(24 * k), alpha=0.6)
-        for i, line in enumerate(lines):
-            _text(img, line, (x0, y0 + i * int(24 * k)), 0.55 * k, YELLOW, 1, shadow=False)
+            c = (int(px * w), int(py * h))
+            cv2.circle(img, c, int(11 * k), T.STATE["ready"] if inside else T.DANGER, -1, cv2.LINE_AA)
+            cv2.circle(img, c, int(11 * k), T.PANEL, max(1, int(2 * k)), cv2.LINE_AA)
+
+    def _debug_panel(self, img, vm: ViewModel, y: int, k: float) -> None:
+        h, w = img.shape[:2]
+        m = int(T.MARGIN * k)
+        rows = [(str(key), str(val)) for key, val in vm.debug.items() if key not in ("hands", "palms", "palms_in_zone")]
+        if not rows:
+            return
+        px = T.SIZE_SMALL * k
+        lh = line_height("regular", int(px))
+        pad = int(12 * k)
+        pw = int(300 * k)
+        ph = pad * 2 + lh * len(rows)
+        x0 = w - m - pw
+        panel(img, x0, y, pw, ph, int(T.RADIUS * k), T.PANEL, 0.78, T.PANEL_EDGE, T.EDGE_ALPHA)
+        for i, (key, val) in enumerate(rows):
+            draw_text(img, key, x0 + pad, y + pad + i * lh, px, T.TEXT_MUTED)
+            draw_text(img, val[:28], x0 + pw - pad, y + pad + i * lh, px, T.TEXT, "regular", "rt")
+
+    # ------------------------------------------------------------ flash, help
+    def _flash(self, img, color, level: float, k: float) -> None:
+        """Inspection warning: a coloured edge glow that fades out (no hard on/off flash)."""
+        h, w = img.shape[:2]
+        t = max(2, int(10 * k))
+        ramp = np.linspace(1.0, 0.0, t, dtype=np.float32)
+        a = level * 0.9
+        top = np.repeat(ramp[:, None], w, axis=1)
+        left = np.repeat(ramp[None, :], h, axis=0)
+        blend_mask(img, top, 0, 0, color, a)
+        blend_mask(img, top[::-1], 0, h - t, color, a)
+        blend_mask(img, left, 0, 0, color, a)
+        blend_mask(img, left[:, ::-1], w - t, 0, color, a)
+
+    def _help(self, img, vm: ViewModel, k: float) -> None:
+        h, w = img.shape[:2]
+        px, small, tpx = T.SIZE_BODY * k, T.SIZE_SMALL * k, T.SIZE_TITLE * k
+        pad = int(T.PAD * 1.6 * k)
+        lh = int(line_height("regular", int(px)) * 1.15)
+        slh = line_height("regular", int(small))
+        th = int(line_height("semibold", int(tpx)) * 1.4)
+        pw = int(720 * k)
+        cols = 2
+        rows = (len(HELP_KEYS) + 1) // cols
+        status = [ln for s in vm.status_lines for ln in wrap(s, pw - 2 * pad, int(small))]
+        ph = pad + th + rows * lh + int(12 * k) + slh * len(status) + pad
+        x0, y0 = (w - pw) // 2, max(int(T.MARGIN * k), (h - ph) // 2 - int(40 * k))
+        panel(img, x0, y0, pw, ph, int(T.RADIUS * 1.3 * k), T.PANEL, 0.9, T.PANEL_EDGE, 0.16)
+        draw_text(img, "Keys", x0 + pad, y0 + pad, tpx, T.TEXT, "semibold")
+        draw_text(img, "? or F1 to close", x0 + pw - pad, y0 + pad + int(3 * k), small, T.TEXT_MUTED, "regular", "rt")
+        col_w = (pw - 2 * pad) // cols
+        key_w = int(96 * k)
+        for i, (key, desc) in enumerate(HELP_KEYS):
+            if not key:
+                continue
+            c, r = i % cols, i // cols
+            cx, cy = x0 + pad + c * col_w, y0 + pad + th + r * lh
+            kw = text_width(key, "semibold", int(small)) + int(14 * k)
+            kh = line_height("semibold", int(small)) + int(4 * k)
+            panel(img, cx, cy + (lh - kh) // 2 - int(2 * k), kw, kh, int(6 * k), T.TEXT, 0.12, T.TEXT, 0.18)
+            draw_text(img, key, cx + kw / 2, cy + lh / 2 - int(2 * k), small, T.TEXT, "semibold", "mm")
+            draw_text(img, desc, cx + key_w + int(8 * k), cy + lh / 2 - int(2 * k), px, T.TEXT_MUTED, "regular", "lm")
+        y = y0 + pad + th + rows * lh + int(12 * k)
+        for s in status:
+            draw_text(img, s, x0 + pad, y, small, T.TEXT_FAINT)
+            y += slh

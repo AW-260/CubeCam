@@ -49,7 +49,54 @@ other OSes OpenCV can't see key releases, so each press *toggles* the held state
 `SPACE` timer · `2` toggle +2 on last solve · `D` toggle DNF · `Backspace` delete
 last solve · `I` toggle inspection · `N` new scramble · `H` debug overlay ·
 `M` start-zone / mat setup (see below) · `T` table calibration for the AR mat ·
-`A` AR mat look on/off · `Esc` abort current solve (not recorded) · `Q` quit
+`A` AR mat look on/off · `?` or `F1` help card (keys, camera / FPS / zone status) ·
+`Esc` abort current solve (not recorded) · `Q` quit
+
+## The screen
+
+![CubeCam, ready to start](docs/screenshots/after/3_ready.jpg)
+
+* The whole camera picture is the background, with a few dark translucent
+  rounded panels over it:
+  * the scramble at the top;
+  * a compact session panel on the left (last, best, mo3, ao5, ao12, mean, the
+    last 5 solves);
+  * the big timer in the centre, with a short state line under it (for example
+    "Ready — lift to start").
+* The bottom of the picture is left free for the mat. Keys and the camera, FPS
+  and zone status are in a help card that opens with `?` or `F1`. A small
+  "? help" pill at the top right is the only reminder.
+* Messages appear under the scramble and fade out. Warnings (e.g. a zone that is
+  too small) are small orange pills at the top right. The `H` debug panel sits
+  under them.
+* **Text and colours:** all text is TrueType, rendered with Pillow. On Windows it
+  uses Segoe UI for text and Bahnschrift SemiBold for the timer, with digits in
+  equal-width cells so a running time doesn't jitter sideways. Elsewhere it uses
+  the usual system sans fonts, or any `.ttf` you put in `assets/fonts/`, and
+  Pillow's built-in scalable font as the last resort. One small palette
+  (`theme.py`) is shared by the panels, the timer, the zone and the AR mat:
+  * grey = idle
+  * amber = holding
+  * green = ready
+  * coral = solving
+  * blue = setup
+* **Smooth states:** colours ease from one state to the next over about 0.2 s,
+  the AR mat cross-fades between states, the hold progress fills continuously,
+  messages fade out, and the inspection warning is an edge glow that fades
+  instead of a hard flash.
+* **Speed:** `python tools/profile_ui.py` runs the real loop on the live camera
+  (hand tracking + drawing). Measured on this machine at 1280x720, 30 fps, before
+  and after this redesign:
+
+  | | processed FPS before / after | whole-UI render, median before / after |
+  |---|---|---|
+  | AR mat off | 29.6 / 29.7 | 2.8 / 2.5 ms |
+  | AR mat on, two hands over it | 29.7 / 29.7 | 4.7 / 5.0 ms |
+  | AR mat on, no hands | 29.7 / 29.7 | 4.6 / 3.0 ms |
+* Before and after pictures of this redesign are in `docs/screenshots/before/`,
+  `docs/screenshots/after/` and `docs/screenshots/compare/` (side by side).
+  `python tools/ar_screenshots.py` re-renders the "after" set from a synthetic
+  table.
 
 ## Setting up the start zone ("mat")
 
@@ -98,32 +145,34 @@ can't arm it.
      (it never slows the timer). If the camera is bumped, the zone moves with
      the mat. If one marker is hidden under a hand, its position is estimated
      from the other three. If more are hidden, the last known zone is kept. The
-     status bar shows `Zone: markers (4/4 markers)` and so on.
+     help card (`?`) shows `Zone: markers (4/4 markers)` and so on.
    * The saved points are used at startup until the markers are seen again.
      Choosing a drag or hands zone switches marker mode off.
 
 **Warnings.** If a zone is mostly outside the camera picture (less than half of it
 visible) or too small (under 2 % of the frame, or narrower than 12 % of its
 width), the setup shows it in orange with a warning before you accept. An active
-zone with that problem also shows an orange outline and a "ZONE WARNING" line in
-the status bar.
+zone with that problem also shows an orange outline and a warning pill at the top
+right.
 
 ## AR mat: a virtual mat lying on your table
 
-![AR mat](docs/screenshots/ar_mat/3_ready.jpg)
+![AR mat](docs/screenshots/after/2_holding.jpg)
 
 Once the app knows where the table is, it draws a start mat that looks like it's
 lying flat on your real table in perspective. That outline is the timer's start
 zone. The mat shows the timer state itself:
-* **Idle:** dark mat, "REST HANDS".
-* **Holding:** the hand pads fill up in yellow.
-* **Ready:** green pads and a green glow round the mat.
-* **Solving:** a thin red rim.
+* **Idle:** graphite mat, a dim light strip, "PLACE HANDS".
+* **Holding:** an amber strip, and the pads fill up smoothly from the near edge.
+* **Ready:** green pads and strip, and a soft green glow round the mat.
+* **Solving:** a coral strip.
+
+States cross-fade over about 0.2 s instead of switching.
 
 Your hands are drawn on top of the mat: it is cut away wherever a hand is.
 The mat graphic is original (no brand names or logos). More screenshots, made from
 a synthetic table with `python tools/ar_screenshots.py`, are in
-`docs/screenshots/ar_mat/`: idle, holding, ready, solving, AR off, the calibration
+`docs/screenshots/after/`: idle, holding, ready, solving, AR off, the calibration
 screen and the mat placement screen.
 
 Without a table calibration nothing changes: the zone works as described above.
@@ -203,13 +252,20 @@ After calibrating, mat placement opens by itself (later: `M`).
   is only cosmetic. The timer uses the palm centres, not the picture.
 
 ### How it is drawn, and why it doesn't slow the timer
-* The mat graphic is made once per size and state: dark rubber, rounded corners,
-  two pads with grip dots, a status window and a bevelled border. It is warped
+* The mat graphic is made once per size and state, in the shared palette:
+  * a graphite body with a soft rim highlight and sheen;
+  * two raised hand pads with a simple open-hand outline;
+  * an inset light strip in the state colour;
+  * a status window with TrueType text.
+
+  It is warped
   into perspective with `cv2.warpPerspective`, and the result is cached. A new warp
   only happens when the plane, the mat or the state changes. Other states are
   prepared in a background thread, so a state change never stalls a frame.
-* Each frame only composites the cached mat (`cv2.blendLinear`) and cuts out the
-  hands:
+* Each frame only composites the cached mat (`cv2.blendLinear`). The hold fill
+  is drawn per frame as a projected polygon, so it grows smoothly rather than in
+  steps. A state change blends the old and new mat for about 0.2 s. Each frame
+  also cuts out the hands:
   * The hand shape comes from the landmarks (palm, finger bones, a stub of the
     forearm).
   * Skin-coloured pixels near the hands are added, but only if they differ from a
@@ -261,7 +317,7 @@ and reloaded on startup.
 * Debounce (default 50 ms) filters tracking flicker. Each edge is still
   timestamped at the *first* changed frame, so debounce adds display latency but
   no timing error.
-* The status bar shows the capture FPS, the FPS actually processed by the hand
+* The help card (`?` / `F1`) shows the capture FPS, the FPS actually processed by the hand
   tracker, and the resulting resolution (±1 processed frame). On a 30 fps webcam
   that's about ±33 ms. A 60/120 fps camera improves it proportionally, as long as
   detection keeps up (see `detect ms` in the debug overlay; lower
@@ -297,12 +353,15 @@ keeps showing the camera and stays usable with the spacebar.
 | `ar_mat.py` | The mat on the plane (place, rotate, build round hands), mat graphic, cached warps, hand cut-out |
 | `synth_table.py` | Synthetic camera views of a table, phone and hands (tests, screenshots) |
 | `tools/make_phone_marker.py` | Phone-screen PNG with the calibration marker |
-| `tools/ar_screenshots.py` | Renders the AR mat screenshots in `docs/screenshots/ar_mat/` |
+| `tools/ar_screenshots.py` | Renders the UI / AR mat screenshots in `docs/screenshots/after/` |
+| `theme.py` | The palette, sizes and timings shared by the panels and the AR mat |
+| `gfx.py` | TrueType text (Pillow, cached masks, equal-width timer digits), rounded panels, blending |
+| `tools/profile_ui.py` | Processed FPS and render time on the live camera, AR mat off / on |
 | `timer_state.py` | Pure state machine (no OpenCV, no clock) fed `(timestamp, active)` samples |
 | `stats.py` | best, mo3, ao5, ao12, mean (WCA rules: trim best/worst, DNF = worst) |
 | `scramble.py` | 20-move random-move scrambles (no `R R'`, no `R L R`) |
 | `storage.py` | Atomic JSON save/load, backs up a corrupt file |
-| `ui.py` | OpenCV drawing from a `ViewModel` |
+| `ui.py` | Drawing from a `ViewModel`: layout, panels, timer, help card, smooth state colours |
 | `keyinput.py` | Spacebar held-state (Windows `GetAsyncKeyState`) |
 | `config.py` / `config.yaml` | Defaults + user config |
 
@@ -347,6 +406,16 @@ and +2), scrambles and storage. `tests/test_zone.py` covers the zone:
   for a steady mat), and the hand mask covering hands but not a skin-coloured
   table. Also that skin pixels extend the landmark shape, the hands staying on top
   of the drawn mat, and a per-frame cost check.
+
+`tests/test_ui.py` covers the screen:
+* **Text:** TrueType fonts for every role, equal-width timer digits, text anchors
+  and clipping.
+* **Panels and rendering:** rounded panels, and a full render with every overlay
+  at 720p, 1080p and 480p.
+* **Layout and keys:** the bottom of the picture stays untouched, and `?` / `F1`
+  toggle the help card.
+* **Smooth states:** colours ease instead of jumping, the mat cross-fades between
+  states, and the hold fill grows at every step with a single warp per state.
 * **Markers:** detected in a synthetic perspective desk scene (mirrored and not),
   the estimated 4th marker and the hold when markers are covered, and the printed
   sheet is detectable with a well-formed PDF.
