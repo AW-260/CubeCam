@@ -10,12 +10,12 @@ solves as training data. Move counting comes in a later stage.
 
 ## Setup
 
-Requires Python 3.10 or 3.11 (developed and tested on 3.10.11; mediapipe 0.10.21
-supports 3.9–3.12).
+Requires Python 3.12 (developed and tested on 3.12.10; 3.10.11 also worked
+before. mediapipe 0.10.21 supports 3.9–3.12, so 3.13+ won't work).
 
 ```powershell
 cd CubeCam
-python -m venv .venv
+py -3.12 -m venv .venv                # macOS/Linux: python3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 ```
