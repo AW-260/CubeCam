@@ -266,18 +266,18 @@ def test_setup_drag_outside_window_is_clamped():
 def test_setup_cycle_order_and_availability():
     s = ZoneSetup()
     s.start()
+    assert s.cycle() is SetupMode.DRAW
     assert s.cycle() is SetupMode.HANDS
     assert s.cycle() is SetupMode.MARKERS
     assert s.cycle() is None and not s.active
     s = ZoneSetup(hands_available=True, markers_available=False)
     s.start()
-    assert s.cycle() is SetupMode.HANDS and s.cycle() is None
+    assert s.cycle() is SetupMode.DRAW and s.cycle() is SetupMode.HANDS and s.cycle() is None
 
 
 def test_setup_hands_mode_proposes_zone_and_mouse_is_ignored():
     s = ZoneSetup(hold=1.0)
-    s.start()
-    s.cycle()
+    s.start(SetupMode.HANDS)
     s.on_mouse(EVENT_LBUTTONDOWN, 0, 0, 1280, 720)
     s.on_mouse(EVENT_LBUTTONUP, 600, 600, 1280, 720)
     assert s.candidate is None
@@ -294,6 +294,55 @@ def test_setup_hands_mode_proposes_zone_and_mouse_is_ignored():
     for i in range(40):
         s.update(3 + i / 30, hands)
     assert s.accept()[0] == "fixed"
+
+
+def _trace(s, path, w=1280, h=720, release=True):
+    s.on_mouse(EVENT_LBUTTONDOWN, *path[0], w, h)
+    for p in path[1:]:
+        s.on_mouse(EVENT_MOUSEMOVE, *p, w, h)
+    if release:
+        s.on_mouse(EVENT_LBUTTONUP, *path[-1], w, h)
+
+
+def wobbly_loop(cx, cy, rx, ry, n=120, overshoot=1.07, seed=2):
+    """A hand-traced loop in px: jittery, and running a little past its start."""
+    rng = np.random.default_rng(seed)
+    t = np.linspace(0, 2 * math.pi * overshoot, n)
+    pts = np.column_stack([cx + rx * np.cos(t), cy + ry * np.sin(t)]) + rng.normal(0, 2.0, (n, 2))
+    return [tuple(map(float, p)) for p in pts]
+
+
+def test_setup_draw_mode_on_screen():
+    s = ZoneSetup()
+    s.start(SetupMode.DRAW)
+    path = wobbly_loop(640, 560, 380, 110)
+    _trace(s, path[:60], release=False)
+    v = s.view()
+    assert len(v.stroke) > 30 and s.candidate is None            # the path shows while tracing
+    assert "let go" in v.lines[0]
+    s.on_mouse(EVENT_LBUTTONUP, *path[59], 1280, 720)               # let go half-way: a half loop...
+    s.redo()
+    _trace(s, path)                                                 # ...R, then the whole loop
+    z = s.candidate
+    assert z is not None and s.view().stroke == []
+    assert 8 <= len(z.points) <= 64                                  # simplified
+    assert z.contains(0.5, 560 / 720) and not z.contains(0.5, 0.3)
+    x0, y0, x1, y1 = z.bbox
+    assert abs(x0 * 1280 - 260) < 12 and abs(x1 * 1280 - 1020) < 12  # the size of what was traced
+    assert abs(y0 * 720 - 450) < 12 and abs(y1 * 720 - 670) < 12
+    assert s.view().warnings == []
+    mode, zone, mat = s.accept()
+    assert mode == "fixed" and mat is None and zone is z
+
+
+def test_setup_draw_mode_rejects_lines_and_scribbles():
+    s = ZoneSetup()
+    s.start(SetupMode.DRAW)
+    _trace(s, [(100 + 8 * i, 500 + 0.5 * i) for i in range(100)])  # a straight line encloses nothing
+    assert s.candidate is None and "closed loop" in s.note
+    _trace(s, [(600 + i, 400) for i in range(0, 40, 3)])            # far too short
+    assert s.candidate is None and "Too short" in s.note
+    assert s.accept() is None and s.active
 
 
 def test_setup_markers_mode():

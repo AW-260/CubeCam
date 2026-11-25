@@ -1,4 +1,5 @@
 """GUI: TrueType text, panels, the full render, smooth state changes, the help card."""
+import math
 import time
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from PIL import ImageFont
 
 import gfx
 import theme as T
-from ar_mat import ArMatRenderer, Mat, mat_layout
+from ar_mat import ArMatRenderer, Mat, mat_layout, texture_ppc
 from plane import TablePlane, _h_apply
 from stats import compute_stats
 from synth_table import SynthCamera, hand_landmarks
@@ -93,7 +94,8 @@ def test_full_render_every_overlay(size):
     # setup and calibration overlays too
     setup = SetupView("ZONE SETUP 1/3: mat", ["Drag the mat", "ENTER accept   R redo   ESC cancel"],
                       candidate=Zone.rect(0.2, 0.6, 0.5, 0.3), warnings=["too small"], progress=0.4,
-                      palms=[(0.3, 0.7)], markers=[(0.2, 0.6)], drag=((0.1, 0.1), (0.3, 0.3)))
+                      palms=[(0.3, 0.7)], markers=[(0.2, 0.6)], drag=((0.1, 0.1), (0.3, 0.3)),
+                      stroke=[(0.3 + 0.2 * math.cos(a), 0.75 + 0.1 * math.sin(a)) for a in np.linspace(0, 5, 40)])
     r.render(np.full((h, w, 3), 90, np.uint8), _full_vm(ar=None, setup=setup, show_help=False))
     calib = CalibView("TABLE CALIBRATION 2/2", ["Click 4 corners"], ["warn"], clicks_px=[(100, 100), (300, 120)],
                       mouse_px=(w * 0.5, h * 0.5), grid_px=[np.array([[10.0, 10.0], [200.0, 300.0]])],
@@ -149,6 +151,7 @@ def _mat_frame():
 
 
 def test_mat_state_change_cross_fades():
+    # idle -> holding (no hold progress yet, so only the static look changes)
     img, quad = _mat_frame()
     r = ArMatRenderer(background=False, animate=True)
     r.draw(img.copy(), quad, (30, 22), "idle")
@@ -156,41 +159,49 @@ def test_mat_state_change_cross_fades():
     r2 = ArMatRenderer(background=False, animate=False)
     r2.draw(idle, quad, (30, 22), "idle")
     ready = img.copy()
-    r2.draw(ready, quad, (30, 22), "ready")
+    r2.draw(ready, quad, (30, 22), "holding")
     first = img.copy()
-    r.draw(first, quad, (30, 22), "ready")                   # the fade starts from the old state
+    r.draw(first, quad, (30, 22), "holding")                 # the fade starts from the old state
     assert r._fade is not None
     assert np.abs(first.astype(int) - idle.astype(int)).max() <= 1
     time.sleep(T.FADE_S / 2)
     mid = img.copy()
-    r.draw(mid, quad, (30, 22), "ready")                     # half-way: in between
+    r.draw(mid, quad, (30, 22), "holding")                   # half-way: in between
     diff_idle = np.abs(mid.astype(int) - idle.astype(int)).sum()
     diff_ready = np.abs(mid.astype(int) - ready.astype(int)).sum()
     total = np.abs(ready.astype(int) - idle.astype(int)).sum()
     assert diff_idle < total and diff_ready < total and diff_ready > 0
     time.sleep(T.FADE_S + 0.02)
     end = img.copy()
-    r.draw(end, quad, (30, 22), "ready")
+    r.draw(end, quad, (30, 22), "holding")
     assert r._fade is None and np.abs(end.astype(int) - ready.astype(int)).max() <= 1
 
 
 def test_hold_fill_grows_smoothly():
     img, quad = _mat_frame()
     r = ArMatRenderer(background=False, animate=False)
-    amber = np.array(T.STATE["holding"], dtype=int)
     counts = []
     for p in (0.0, 0.2, 0.4, 0.6, 0.8, 1.0):
         out = img.copy()
         r.draw(out, quad, (30, 22), "holding", p)
-        d = np.abs(out.astype(int) - amber).sum(axis=2)
-        counts.append(int((d < 200).sum()))
-    assert all(b > a for a, b in zip(counts, counts[1:])), counts   # more filled at every step
-    # no stepped textures any more: only one warp per state
-    assert r.warps <= 4
+        counts.append(int((out.astype(int).sum(axis=2) > 3 * 120 + 150).sum()))   # brightly lit pixels
+    assert all(b > a for a, b in zip(counts, counts[1:])), counts   # more of the edge lit at every step
+    # drawn per frame, not as stepped textures: one warp per state plus the light-effect maps
+    assert r.warps <= 5
 
 
 def test_mat_layout_inside_texture():
     L = mat_layout(30, 22)
     x0, y0, x1, y1 = L.rect
-    for px0, py0, px1, py1 in L.pads + (L.window,):
-        assert x0 < px0 < px1 < x1 and y0 < py0 < py1 < y1
+    W_, H_ = L.size
+    assert 0 < x0 < x1 < W_ and 0 < y0 < y1 < H_ and L.rounded
+    o = L.outline
+    assert o[:, 0].min() >= x0 - 0.5 and o[:, 0].max() <= x1 + 0.5
+    assert o[:, 1].min() >= y0 - 0.5 and o[:, 1].max() <= y1 + 0.5
+    # a drawn shape fills its own bounding box; big ones use fewer texture px per cm
+    tri = ((-20.0, 10.0), (0.0, -10.0), (20.0, 10.0))
+    Ls = mat_layout(40, 20, shape=tri)
+    assert not Ls.rounded and len(Ls.outline) > 3                    # drawn smooth (corner cutting)
+    assert Ls.outline[:, 0].min() >= Ls.rect[0] - 0.5 and Ls.outline[:, 1].max() <= Ls.rect[3] + 0.5
+    assert texture_ppc(120, 60) < texture_ppc(30, 22)
+    assert max(mat_layout(120, 60).size) <= 1600

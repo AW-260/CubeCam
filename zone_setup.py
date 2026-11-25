@@ -4,6 +4,10 @@ Modes (M cycles through them, then closes; Esc cancels, Enter accepts):
   * mat (only with a table plane, see key T): the AR mat lies on the table.
     Drag it to slide it across the table in perspective; [ and ] rotate it.
   * drag (without a table plane): click and drag a rectangle on the view.
+  * draw: trace your own shape with the mouse. The path is smoothed and
+    simplified into a clean closed shape (freehand.py). With a table plane
+    it lies flat on the table (kept in table cm, an AR area); without one
+    it's a shape on the screen.
   * hands: rest both hands where the mat should be and hold still ~2 s. With a
     table plane the mat is built on the table round your hands; without one
     it's a rectangle round both hands plus a margin.
@@ -11,6 +15,7 @@ Modes (M cycles through them, then closes; Esc cancels, Enter accepts):
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Sequence
@@ -22,17 +27,20 @@ from zone import HandsZoneBuilder, Point, Zone, palm_centre, zone_warnings
 # OpenCV mouse event codes (kept here so this module doesn't need cv2)
 EVENT_MOUSEMOVE, EVENT_LBUTTONDOWN, EVENT_LBUTTONUP = 0, 1, 4
 MIN_DRAG = 0.02  # a drag shorter than this (fraction of the frame) is a click, not a zone
+MIN_TRACE = 0.25  # a traced path shorter than this (fraction of the frame width) is too short for a shape
 ROTATE_STEP = 5.0
 
 
 class SetupMode(str, Enum):
     MAT = "mat"
     DRAG = "drag"
+    DRAW = "draw"
     HANDS = "hands"
     MARKERS = "markers"
 
 
-NAMES = {SetupMode.MAT: "mat", SetupMode.DRAG: "drag", SetupMode.HANDS: "hands", SetupMode.MARKERS: "markers"}
+NAMES = {SetupMode.MAT: "mat", SetupMode.DRAG: "drag", SetupMode.DRAW: "draw", SetupMode.HANDS: "hands",
+         SetupMode.MARKERS: "markers"}
 
 
 @dataclass
@@ -47,6 +55,7 @@ class SetupView:
     warnings: list[str] = field(default_factory=list)
     palms: list[Point] = field(default_factory=list)
     markers: list[Point] = field(default_factory=list)
+    stroke: list[Point] = field(default_factory=list)      # the path being traced (draw mode)
 
 
 class ZoneSetup:
@@ -67,13 +76,15 @@ class ZoneSetup:
         self._palms: list[Point] = []
         self._markers: list[Point] = []
         self._marker_status = ""
+        self._stroke: list[Point] = []
+        self._tracing = False
         self.note = ""
 
     # ---------------------------------------------------------------- control
     @property
     def modes(self) -> list[SetupMode]:
         first = SetupMode.MAT if self.plane is not None else SetupMode.DRAG
-        out = [first]
+        out = [first, SetupMode.DRAW]
         if self.hands_available:
             out.append(SetupMode.HANDS)
         if self.markers_available:
@@ -100,6 +111,8 @@ class ZoneSetup:
         self._palms = []
         self._markers = []
         self._marker_status = ""
+        self._stroke = []
+        self._tracing = False
         self.note = ""
         self.builder.reset()
         if mode is SetupMode.MAT:
@@ -170,6 +183,9 @@ class ZoneSetup:
         if self.mode is SetupMode.MAT:
             self._mat_mouse(event, p)
             return
+        if self.mode is SetupMode.DRAW:
+            self._draw_mouse(event, p, width, height)
+            return
         if self.mode is not SetupMode.DRAG:
             return
         if event == EVENT_LBUTTONDOWN:
@@ -205,6 +221,50 @@ class ZoneSetup:
                 self.note = "The mat would leave the visible table there"
         elif event == EVENT_LBUTTONUP:
             self._grab = None
+
+    def _draw_mouse(self, event: int, p: Point, width: int, height: int) -> None:
+        if event == EVENT_LBUTTONDOWN:
+            self._stroke, self._tracing = [p], True
+            self.candidate = self.candidate_mat = None
+            self.note = ""
+        elif event == EVENT_MOUSEMOVE and self._tracing:
+            last = self._stroke[-1]
+            if math.hypot((p[0] - last[0]) * width, (p[1] - last[1]) * height) >= 2.0:
+                self._stroke.append(p)
+        elif event == EVENT_LBUTTONUP and self._tracing:
+            self._tracing = False
+            self._stroke.append(p)
+            self._finish_trace(width, height)
+
+    def _finish_trace(self, width: int, height: int) -> None:
+        """Turn the traced path into the candidate shape (on the table if there is a plane)."""
+        from freehand import clean_shape, path_length
+
+        pts = np.array(self._stroke, dtype=np.float64)
+        self._stroke = []
+        px = pts * (width, height)
+        if len(pts) < 8 or path_length(px) < MIN_TRACE * width:
+            self.note = "Too short - hold the button and trace a loop round the whole area"
+            return
+        if self.plane is not None:
+            from ar_mat import Mat
+
+            tp, ok = self.plane.to_table_norm(pts)
+            if ok.mean() < 0.9:
+                self.note = "Part of the shape is above the table's horizon - draw it on the table"
+                return
+            shape = clean_shape(tp[ok])
+            if shape is None:
+                self.note = "That doesn't enclose an area - trace a closed loop"
+                return
+            if not self._set_mat(Mat.from_outline(shape)):
+                self.note = "That shape would leave the visible table - draw it a little smaller"
+            return
+        shape = clean_shape(px)
+        if shape is None:
+            self.note = "That doesn't enclose an area - trace a closed loop"
+            return
+        self.candidate = Zone(tuple(map(tuple, np.clip(shape / (width, height), 0.0, 1.0))))
 
     def update(self, t: float, hands: Sequence[np.ndarray] | None = None,
                marker_zone: Zone | None = None, marker_status: str = "",
@@ -250,6 +310,20 @@ class ZoneSetup:
                 lines.append(f"Mat {m.width_cm:g} x {m.height_cm:g} cm, turned {m.angle_deg:+.0f} deg "
                              "(size: mat.width_cm / height_cm in config.yaml)")
             keys = f"ENTER accept   [ ] rotate   R reset   {nxt}   ESC cancel"
+        elif self.mode is SetupMode.DRAW:
+            flat = " It lies flat on the table." if self.plane is not None else ""
+            if self._tracing:
+                lines = ["Keep tracing round the area, then let go to close the shape."]
+            elif self.candidate is None:
+                lines = ["Hold the left mouse button and trace round the area where you rest your hands." + flat,
+                         "Let go to close it; the path is smoothed into a clean shape."]
+            else:
+                lines = ["Press ENTER to use this shape, or draw again." + flat]
+                m = self.candidate_mat
+                if m is not None:
+                    lines.append(f"About {m.width_cm:.0f} x {m.height_cm:.0f} cm on the table")
+            rot = "   [ ] rotate" if self.candidate_mat is not None else ""
+            keys = f"ENTER accept{rot}   R clear   {nxt}   ESC cancel"
         elif self.mode is SetupMode.DRAG:
             lines = ["Click and drag a rectangle over the desk area where you rest your hands."]
             if self.candidate is not None:
@@ -281,4 +355,5 @@ class ZoneSetup:
             warnings=zone_warnings(self.candidate) if self.candidate is not None else [],
             palms=list(self._palms),
             markers=list(self._markers),
+            stroke=list(self._stroke),
         )

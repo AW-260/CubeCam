@@ -4,8 +4,10 @@
 
 Runs the app's real per-frame work on the live camera (capture -> hand
 tracking -> state machine -> build_view -> render), without showing a window,
-in four phases: AR mat off, AR mat on with two (simulated) hands over the mat,
-off again, on without hands. The table plane is calibrated from the synthetic
+in five phases: AR mat off, AR mat on with two (simulated) hands over the mat,
+off again, on without hands, and on with the mat cycling through every state
+(idle -> holding -> ready -> solving -> idle, every 3 s, so state changes and
+their animations are included). The table plane is calibrated from the synthetic
 phone picture used by tools/ar_screenshots.py, so the mat is drawn even if your
 camera doesn't see a table; the hands are fake landmarks over the mat so the
 hand cut-out runs too. Nothing is saved (a temporary config is used).
@@ -68,8 +70,22 @@ def main(argv=None) -> int:
     cx, cy = quad.mean(axis=0)
     hands = [hand_landmarks((cx - 150, cy + 10), 90, right=False) / (W, H), hand_landmarks((cx + 150, cy + 10), 90) / (W, H)]
 
-    def phase(seconds, ar_on, fake_hands):
+    # a simulated solve cycle for the "cycling" phase: (seconds from start, state, hold progress)
+    def cycle_state(t):
+        u = t % 3.0
+        if u < 0.6:
+            return "idle", 0.0
+        if u < 0.9:
+            return "holding", (u - 0.6) / 0.3
+        if u < 1.4:
+            return "ready", 0.0
+        if u < 2.6:
+            return "solving", 0.0
+        return "idle", 0.0
+
+    def phase(seconds, ar_on, fake_hands, cycling=False):
         app.ar_enabled = ar_on
+        start = time.perf_counter()
         last, ts, render_ms, detect_ms = 0, [], [], []
         end = time.perf_counter() + seconds
         while time.perf_counter() < end:
@@ -88,6 +104,8 @@ def main(argv=None) -> int:
                 sample = TriggerSample(t, sample.active, dict(sample.debug, hands=fake_hands))
             t0 = time.perf_counter()
             vm = app.build_view(t, sample, False, img.shape[1])
+            if cycling and vm.ar is not None:
+                vm.ar.state, vm.ar.progress = cycle_state(time.perf_counter() - start)
             app.renderer.render(img, vm)
             render_ms.append((time.perf_counter() - t0) * 1000)
             ts.append(t)
@@ -96,12 +114,13 @@ def main(argv=None) -> int:
 
     print(f"camera {W}x{H}, capture {app.camera.measured_fps:.1f} fps")
     rows = []
-    for label, ar_on, fh in (("AR off", False, None), ("AR on, 2 hands over the mat", True, hands),
-                             ("AR off again", False, None), ("AR on, no hands", True, None)):
-        phase(0.8, ar_on, fh)                 # settle, let background warps finish
-        fps, rms, dms = phase(args.seconds, ar_on, fh)
+    for label, ar_on, fh, cyc in (("AR off", False, None, False), ("AR on, 2 hands over the mat", True, hands, False),
+                                  ("AR off again", False, None, False), ("AR on, no hands", True, None, False),
+                                  ("AR on, cycling states, hands", True, hands, True)):
+        phase(0.8, ar_on, fh, cyc)            # settle, let background warps finish
+        fps, rms, dms = phase(args.seconds, ar_on, fh, cyc)
         rows.append((label, fps, rms, dms))
-        print(f"{label:28s} processed {fps:5.1f} fps | render median {statistics.median(rms):5.2f} ms, "
+        print(f"{label:30s} processed {fps:5.1f} fps | render median {statistics.median(rms):5.2f} ms, "
               f"p95 {np.percentile(rms, 95):5.2f} ms | hand tracking median {statistics.median(dms):5.1f} ms")
     print(f"camera capture {app.camera.measured_fps:.1f} fps")
     app.close()

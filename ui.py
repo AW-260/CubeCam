@@ -58,11 +58,12 @@ HELP = "  ".join(f"{k} {v}" for k, v in HELP_KEYS if k)   # one-line version (ke
 class ArView:
     """The AR mat to draw this frame."""
 
-    quad: np.ndarray                         # (4, 2) image px: far-left, far-right, near-right, near-left
+    quad: np.ndarray                         # (4, 2) image px of the bounding box: far-left, far-right, near-right, near-left
     size_cm: tuple[float, float]
     state: str = "idle"                      # idle | holding | ready | solving
     progress: float = 0.0
     hands_px: list = field(default_factory=list)   # (21, 2) landmark arrays in image px
+    shape: tuple | None = None               # a drawn outline (cm, see ar_mat.Mat.shape); None = rectangle
 
 
 @dataclass
@@ -118,8 +119,10 @@ class Renderer:
         return tuple(int(round(v)) for v in cur)
 
     # ---------------------------------------------------------------- render
-    def render(self, img: np.ndarray, vm: ViewModel) -> np.ndarray:
-        now = time.perf_counter()
+    def render(self, img: np.ndarray, vm: ViewModel, now: float | None = None) -> np.ndarray:
+        """Draw vm over img (in place) and return it. now: the animation clock (perf_counter s)."""
+        anim_now = now
+        now = time.perf_counter() if now is None else now
         self._dt = 0.0 if self._last_t is None else min(0.2, now - self._last_t)
         self._last_t = now
         h, w = img.shape[:2]
@@ -129,7 +132,7 @@ class Renderer:
             loupe = self._loupe_crop(img, vm.calib.mouse_px, k)   # from the clean frame, before overlays
         if vm.ar is not None:
             a = vm.ar
-            self.ar.draw(img, a.quad, a.size_cm, a.state, a.progress, a.hands_px)
+            self.ar.draw(img, a.quad, a.size_cm, a.state, a.progress, a.hands_px, shape=a.shape, now=anim_now)
         self._zone(img, vm, k)
         if vm.setup is not None:
             self._setup_marks(img, vm.setup, k, on_ar=vm.ar is not None)
@@ -317,9 +320,13 @@ class Renderer:
             color = T.WARN if sv.warnings else T.ACCENT
             if not on_ar:                    # the AR mat preview already shows the area
                 fill_poly(img, poly, color, 0.16)
-            cv2.polylines(img, [np.int32(np.round(poly * 16))], True, color, thick, cv2.LINE_AA, shift=4)
-            for p in poly:
-                cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(5 * k)), color, -1, cv2.LINE_AA)
+            if not (on_ar and len(poly) > 8):   # a drawn area on the table: its hologram is the outline
+                cv2.polylines(img, [np.int32(np.round(poly * 16))], True, color, thick, cv2.LINE_AA, shift=4)
+            if len(poly) <= 8:               # corner handles (not on a drawn outline's many points)
+                for p in poly:
+                    cv2.circle(img, (int(p[0]), int(p[1])), max(4, int(5 * k)), color, -1, cv2.LINE_AA)
+        if len(sv.stroke) > 1:
+            self._stroke(img, np.array(sv.stroke) * (w, h), k)
         if sv.drag is not None:
             (ax, ay), (bx, by) = sv.drag
             r = np.array([(ax, ay), (bx, ay), (bx, by), (ax, by)]) * (w, h)
@@ -330,6 +337,29 @@ class Renderer:
         for x, y in sv.palms:
             cv2.circle(img, (int(x * w), int(y * h)), int(10 * k), T.STATE["holding"], -1, cv2.LINE_AA)
             cv2.circle(img, (int(x * w), int(y * h)), int(10 * k), T.PANEL, max(1, int(2 * k)), cv2.LINE_AA)
+
+    def _stroke(self, img, pts: np.ndarray, k: float) -> None:
+        """The path being traced in draw mode: a soft glowing line, the start point, and a faint closing line."""
+        H, W = img.shape[:2]
+        glow_w = max(4, int(9 * k))
+        x0, y0 = (np.floor(pts.min(axis=0)) - glow_w).astype(int).clip(0, (W, H))
+        x1, y1 = (np.ceil(pts.max(axis=0)) + glow_w + 1).astype(int).clip(0, (W, H))
+        if x1 > x0 and y1 > y0:                       # the soft glow, only in the stroke's box
+            sub = img[y0:y1, x0:x1]
+            layer = sub.copy()
+            cv2.polylines(layer, [np.int32(np.round((pts - (x0, y0)) * 16))], False, T.ACCENT, glow_w, cv2.LINE_AA,
+                          shift=4)
+            cv2.addWeighted(layer, 0.25, sub, 0.75, 0, dst=sub)
+        p16 = np.int32(np.round(pts * 16))
+        cv2.polylines(img, [p16], False, T.ACCENT, max(2, int(2.5 * k)), cv2.LINE_AA, shift=4)
+        a, b = pts[0], pts[-1]
+        n = max(2, int(np.hypot(*(b - a)) / (12 * k)))
+        for i in range(0, n, 2):                      # dashed: where the shape will close
+            u0, u1 = i / n, min(1.0, (i + 1) / n)
+            cv2.line(img, tuple(np.int32(a + (b - a) * u0)), tuple(np.int32(a + (b - a) * u1)), T.TEXT_MUTED,
+                     max(1, int(1.5 * k)), cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(np.round(a))), max(4, int(6 * k)), T.ACCENT, -1, cv2.LINE_AA)
+        cv2.circle(img, tuple(np.int32(np.round(a))), max(4, int(6 * k)), T.PANEL, max(1, int(1.5 * k)), cv2.LINE_AA)
 
     def _instructions(self, img, title: str, lines_in: list[str], warnings: list[str], progress: float,
                       y: int, side: int, k: float) -> int:

@@ -15,6 +15,7 @@ from ar_mat import (
     mat_at_image_point,
     mat_fits,
     mat_from_hands,
+    mat_layout,
     mat_texture,
     reanchor,
 )
@@ -23,6 +24,7 @@ from markers import detect_marker_corners, make_detector, plane_from_marker
 from plane import TablePlane, _h_apply, estimate_focal, focal_from_hfov, plane_from_rectangle
 from synth_table import SynthCamera, TableScene, draw_hand, hand_landmarks, phone_image
 from table_calib import EVENT_LBUTTONDOWN, EVENT_RBUTTONDOWN, CalibMode, TableCalibration, is_simple_quad, parse_size
+import theme as T
 from zone_setup import EVENT_LBUTTONUP, EVENT_MOUSEMOVE, SetupMode, ZoneSetup
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -438,11 +440,34 @@ def test_texture_states():
         assert tex.shape[2] == 4
         assert tex[0, 0, 3] == 0                              # transparent margin
         assert tex[int(y0) + 2, int(x0) + 2, 3] < 255         # rounded corner
-        assert tex[int((y0 + y1) / 2), int((x0 + x1) / 2), 3] == 255
+        # mostly transparent inside (the table shows through), the outline itself glows
+        cy, cx = int((y0 + y1) / 2), int((x0 + x1) / 2)
+        inner = tex[cy - 40:cy + 40, cx - 60:cx + 60, 3]
+        assert np.median(inner) < 0.3 * 255, state
+        assert tex[int(round(y0)) - 1:int(round(y0)) + 2, cx, 3].max() > (110 if state == "holding" else 150), state
     ready, (x0, y0, x1, y1) = mat_texture(30, 22, "ready")
     idle, _ = mat_texture(30, 22, "idle")
-    gx, gy = int((x0 + x1) / 2), int(y0) - 6                   # just outside the far edge
-    assert ready[gy, gx, 3] > 40 and idle[gy, gx, 3] == 0        # green glow only when ready
+    solving, _ = mat_texture(30, 22, "solving")
+    gx, gy = int((x0 + x1) / 2), int(y0) - 8                   # just outside the far edge
+    assert ready[gy, gx, 3] > idle[gy, gx, 3] > solving[gy, gx, 3] > 0   # ready glows most, solving is calm
+    # colours from the shared palette: the outline's glow is the state colour
+    halo = ready[gy, gx, :3].astype(int)
+    assert np.abs(halo - np.array(T.STATE["ready"])).sum() < 60
+
+
+def test_drawn_texture_follows_its_outline():
+    from freehand import resample_closed
+
+    # a triangle pointing at you, densely sampled like a cleaned-up drawn shape
+    shape = tuple(map(tuple, resample_closed(np.array([(-15.0, -6.0), (15.0, -6.0), (0.0, 8.0)]), 36)))
+    tex, (x0, y0, x1, y1) = mat_texture(30, 14, "idle", shape=shape)
+    L = mat_layout(30, 14, shape=shape)
+    p = L.ppc
+    apex = (int((x0 + x1) / 2), int(y1 - 1.5 * p))                # inside, near the tip
+    beside = (int(x1 - 1.5 * p), int(y1 - 1.5 * p))                # inside the bounding box, outside the triangle
+    assert tex[apex[1], apex[0], 3] > 30
+    assert tex[beside[1], beside[0], 3] < 20
+    assert tex[int((y0 + y1) / 2), int((x0 + x1) / 2), 3] < 0.4 * 255
 
 
 def test_renderer_caches_warps():
@@ -459,7 +484,10 @@ def test_renderer_caches_warps():
     r.draw(img.copy(), quad + (3, 0), (30, 22))       # the mat moved: warped again
     assert r.warps > n
     mid = np.int32(quad.mean(axis=0))
-    assert img[mid[1], mid[0]].max() < 90             # dark mat drawn in the middle
+    inner = img[mid[1] - 15:mid[1] + 15, mid[0] - 15:mid[0] + 15]
+    assert 95 < np.median(inner) < 118                # the table shows through, a little darker
+    far = np.int32(np.round((quad[0] + quad[1]) / 2))
+    assert img[far[1] - 2:far[1] + 3, far[0] - 2:far[0] + 3].max() > 170   # the glowing outline
 
 
 def test_renderer_background_thread_prepares_states():
@@ -531,8 +559,9 @@ def test_hands_are_drawn_on_top_of_the_mat():
     for h in hands:
         palm = np.int32(np.round(h[[0, 5, 9, 13, 17]].mean(axis=0)))
         assert np.abs(out[palm[1], palm[0]].astype(int) - img[palm[1], palm[0]].astype(int)).max() <= 3
-    mid = np.int32(np.round(quad.mean(axis=0) + (0, -60)))
-    assert np.abs(out[mid[1], mid[0]].astype(int) - img[mid[1], mid[0]].astype(int)).max() > 40
+    far = np.int32(np.round((quad[0] + quad[1]) / 2))      # the far edge's outline, away from the hands
+    patch = (slice(far[1] - 2, far[1] + 3), slice(far[0] - 2, far[0] + 3))
+    assert np.abs(out[patch].astype(int) - img[patch].astype(int)).max() > 40
     # timing: a steady mat with two hands costs a few ms per frame
     import time
 
@@ -540,6 +569,167 @@ def test_hands_are_drawn_on_top_of_the_mat():
     for _ in range(10):
         r.draw(img.copy(), quad, (30, 22), "ready", 0, hands)
     assert (time.perf_counter() - t0) / 10 < 0.015
+
+
+def _plain_frame():
+    plane, _ = synthetic_plane()
+    quad = Mat(0, 0, 0, 30, 22).image_quad(plane)
+    return np.full((H, W, 3), 120, np.uint8), quad
+
+
+def _px(img, p, r=2):
+    p = np.int32(np.round(p))
+    return img[p[1] - r:p[1] + r + 1, p[0] - r:p[0] + r + 1].astype(int)
+
+
+def test_hold_light_runs_round_from_the_near_edge():
+    img, quad = _plain_frame()
+    r = ArMatRenderer(background=False, animate=False)
+    near, far = (quad[2] + quad[3]) / 2, (quad[0] + quad[1]) / 2
+    base = img.copy()
+    r.draw(base, quad, (30, 22), "holding", 0.0)
+    third = img.copy()
+    r.draw(third, quad, (30, 22), "holding", 0.3)
+    full = img.copy()
+    r.draw(full, quad, (30, 22), "holding", 1.0)
+    lit = lambda out, p: (_px(out, p) - _px(base, p)).sum(axis=2).max()   # noqa: E731
+    assert lit(third, near) > 80 and lit(third, far) < 10              # starts at the near edge...
+    assert lit(full, far) > 80                                          # ...and meets at the far side
+    left, right = (quad[0] + quad[3]) / 2, (quad[1] + quad[2]) / 2
+    assert abs(lit(full, left) - lit(full, right)) < 40 and lit(full, left) > 80   # both ways round
+
+
+def test_ready_pulses_softly():
+    img, quad = _plain_frame()
+    r = ArMatRenderer(background=False, animate=True)
+    frames = {}
+    for i in range(int(T.PULSE_S * 30) + 1):
+        t = i / 30
+        out = img.copy()
+        r.draw(out, quad, (30, 22), "ready", now=100 + t)
+        frames[i] = out
+    far, centre = (quad[0] + quad[1]) / 2, quad.mean(axis=0)
+    glow = far + (far - centre) / np.linalg.norm(far - centre) * 5          # in the glow just outside the line
+    lum = [int(_px(frames[i], glow).sum()) for i in sorted(frames)]
+    half = len(lum) // 2
+    assert lum[half] > lum[3] > 0                         # brighter at the top of the pulse...
+    assert lum[-1] < lum[half]                            # ...and back down after one period
+    steps = [np.abs(frames[i + 1].astype(int) - frames[i].astype(int)).max() for i in range(len(frames) - 1)]
+    assert max(steps) <= 12                               # smooth: no frame jumps (no flashing)
+    still = ArMatRenderer(background=False, animate=False)
+    a, b = img.copy(), img.copy()
+    still.draw(a, quad, (30, 22), "ready", now=0)
+    still.draw(b, quad, (30, 22), "ready", now=0.7)
+    assert np.array_equal(a, b)                           # stills don't pulse
+
+
+def test_ripple_on_solve_start_and_stop():
+    img, quad = _plain_frame()
+    r = ArMatRenderer(background=False, animate=True)
+    for i in range(10):
+        r.draw(img.copy(), quad, (30, 22), "ready", now=i / 30)
+    steady = ArMatRenderer(background=False, animate=False)
+    solving = img.copy()
+    steady.draw(solving, quad, (30, 22), "solving")
+    centre = quad.mean(axis=0)
+    rings = []
+    t0 = 1.0
+    for k in range(int(T.RIPPLE_S * 30) + 12):
+        out = img.copy()
+        r.draw(out, quad, (30, 22), "solving", now=t0 + k / 30)
+        if k in (7, 11, 15):                      # after the 0.18 s cross-fade
+            rings.append(out)
+        last = out
+    assert r._ripple is None
+    assert np.abs(last.astype(int) - solving.astype(int)).max() <= 1      # gone again: calm solving look
+    # the ring spreads out: where it differs from the calm look moves away from the centre
+    dist = []
+    for out in rings:
+        d = np.abs(out.astype(int) - solving.astype(int)).sum(axis=2)
+        ys, xs = np.nonzero(d > 6)
+        assert len(xs) > 300
+        dist.append(np.median(np.hypot(xs - centre[0], (ys - centre[1]) * 2)))
+    assert dist[0] < dist[1] < dist[2]
+    # and a ripple when the solve stops too
+    r.draw(img.copy(), quad, (30, 22), "idle", now=10.0)
+    assert r._ripple is not None and r._ripple[1] == T.TEXT
+
+
+def test_drawn_area_on_the_table():
+    plane, _ = synthetic_plane()
+    # a kidney-ish outline in table cm (as freehand.clean_shape would give)
+    t = np.linspace(0, 2 * math.pi, 40, endpoint=False)
+    outline = np.column_stack([3 + 22 * np.cos(t), 4 + 9 * np.sin(t) * (1 - 0.3 * np.cos(t) ** 2)])
+    m = Mat.from_outline(outline)
+    assert m.shape is not None and len(m.shape) == 40
+    assert m.width_cm == pytest.approx(44, abs=0.1) and np.allclose(m.outline(), outline, atol=0.01)
+    assert np.allclose(m.corners().min(axis=0), outline.min(axis=0), atol=0.01)
+    # stored in table cm: config round trip, and moving / rotating keep the shape
+    again = Mat.from_config(yaml.safe_load(yaml.safe_dump(m.to_config())))
+    assert again == m
+    r = m.moved_to(0, 0).rotated(90)
+    assert r.shape == m.shape and np.allclose(np.linalg.norm(r.outline(), axis=1),
+                                                 np.linalg.norm(m.outline() - (m.cx, m.cy), axis=1))
+    # the zone is the projected outline, not the bounding box
+    zone = m.zone(plane)
+    assert len(zone.points) == 40
+    pts, _ = plane.to_image(outline)
+    assert np.allclose(np.array(zone.points) * (W, H), pts, atol=0.5)   # stored to 0.01 cm
+    inside = plane.to_image_norm([[3, 4]])[0][0]
+    corner = plane.to_image_norm([m.corners()[0] + (1, 1)])[0][0]       # in the box, outside the shape
+    assert zone.contains(*inside) and not zone.contains(*corner)
+    # re-anchoring after a new calibration keeps the shape
+    assert reanchor(m, plane, plane).shape == m.shape
+    # drawn with hands on top
+    quad = m.image_quad(plane)
+    c = plane.to_image([[3, 4]])[0][0]
+    hands = [hand_landmarks(c + (-110, 0), 70, right=False), hand_landmarks(c + (110, 0), 70)]
+    scene = np.full((H, W, 3), 120, np.uint8)
+    for h in hands:
+        draw_hand(scene, h)
+    rd = ArMatRenderer(background=False)
+    rd.draw(np.full((H, W, 3), 120, np.uint8), quad, (m.width_cm, m.height_cm), shape=m.shape)
+    out = scene.copy()
+    rd.draw(out, quad, (m.width_cm, m.height_cm), "ready", 0, hands, shape=m.shape)
+    for h in hands:
+        palm = h[[0, 5, 9, 13, 17]].mean(axis=0)
+        assert np.abs(_px(out, palm, 1) - _px(scene, palm, 1)).max() <= 3
+    edge = pts[np.argmin(pts[:, 1])]                        # the far point of the outline glows
+    assert (_px(out, edge) - _px(scene, edge)).sum(axis=2).max() > 60
+
+
+def test_draw_mode_on_the_table():
+    plane, _ = synthetic_plane()
+    s = ZoneSetup()
+    s.start(SetupMode.DRAW, plane=plane, mat_size=(30, 22))
+    # trace an ellipse of 40 x 16 cm on the table, as seen on screen
+    t = np.linspace(0, 2 * math.pi * 1.05, 150)
+    rng = np.random.default_rng(4)
+    table = np.column_stack([20 * np.cos(t), 2 + 8 * np.sin(t)])
+    px = plane.to_image(table)[0] + rng.normal(0, 1.5, (150, 2))
+    s.on_mouse(EVENT_LBUTTONDOWN, *px[0], W, H)
+    for p in px[1:]:
+        s.on_mouse(EVENT_MOUSEMOVE, *p, W, H)
+    s.on_mouse(EVENT_LBUTTONUP, *px[-1], W, H)
+    m = s.candidate_mat
+    assert m is not None and m.shape is not None and len(m.shape) <= 64
+    assert m.width_cm == pytest.approx(40, abs=2.5) and m.height_cm == pytest.approx(16, abs=2.0)
+    assert (m.cx, m.cy) == pytest.approx((0, 2), abs=1.5)
+    assert "cm on the table" in " ".join(s.view().lines)
+    assert s.rotate(5) and s.candidate_mat.shape == m.shape
+    mode, zone, mat = s.accept()
+    assert mode == "mat" and mat.shape == m.shape
+    assert zone.contains(*plane.to_image_norm([[0, 2]])[0][0])
+    # the sky is refused
+    s.start(SetupMode.DRAW, plane=plane)
+    sky = [(300 + 300 * math.cos(a), 10 + 8 * math.sin(a)) for a in np.linspace(0, 6.3, 80)]
+    plane2, _ = synthetic_plane(tilt=12, height=30)             # horizon inside the picture
+    s.start(SetupMode.DRAW, plane=plane2)
+    s.on_mouse(EVENT_LBUTTONDOWN, *sky[0], W, H)
+    for p in sky[1:]:
+        s.on_mouse(EVENT_MOUSEMOVE, *p, W, H)
+    s.on_mouse(EVENT_LBUTTONUP, *sky[-1], W, H)
+    assert s.candidate_mat is None and "horizon" in s.note
 
 
 # ================================================================== config

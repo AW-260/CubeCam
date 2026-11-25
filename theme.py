@@ -36,15 +36,28 @@ STATE = {
     "off": rgb(148, 163, 184),
 }
 
-# ------------------------------------------------------------------- the mat
-MAT_BODY_TOP = rgb(44, 49, 58)       # graphite, lit a little from the far side
-MAT_BODY_BOTTOM = rgb(30, 34, 41)
-MAT_RIM = rgb(18, 21, 26)
-MAT_HIGHLIGHT = rgb(96, 104, 118)
-MAT_PAD = rgb(52, 58, 69)
-MAT_PAD_EDGE = rgb(78, 86, 100)
-MAT_ICON = rgb(98, 108, 124)
-MAT_WINDOW = rgb(14, 16, 20)
+# ------------------------------------------------------- the holographic mat
+# Layers of the start area on the table, as opacities (0..1) per state. Each
+# layer is drawn in that state's colour (fill: PANEL, a slight darkening so the
+# light reads on a bright desk; core: the state colour mixed with TEXT, "hot").
+#   fill  - the whole area      edge  - light along the inside of the outline
+#   haze  - wide soft glow      grid  - the faint table grid
+#   glow  - glow round the line core  - the outline itself
+HOLO = {
+    "idle":    {"fill": 0.14, "edge": 0.22, "haze": 0.22, "grid": 0.42, "glow": 0.50, "core": 0.85},
+    "holding": {"fill": 0.12, "edge": 0.10, "haze": 0.10, "grid": 0.24, "glow": 0.14, "core": 0.30},
+    "ready":   {"fill": 0.14, "edge": 0.32, "haze": 0.38, "grid": 0.42, "glow": 0.62, "core": 0.95},
+    "solving": {"fill": 0.10, "edge": 0.12, "haze": 0.14, "grid": 0.14, "glow": 0.24, "core": 0.50},
+}
+# the hologram's colour per state: the state colours, with idle's slate tinted towards ACCENT
+HOLO_COLOR = {**STATE, "idle": tuple(round(a * 0.4 + b * 0.6) for a, b in zip(STATE["idle"], ACCENT))}
+HOT_MIX = 0.45       # how much TEXT (near white) is mixed into the outline's core
+HOLD_LIGHT = 1.0     # holding: the light that runs round the outline
+PULSE_S = 1.5        # ready: one soft pulse
+PULSE_LOW, PULSE_HIGH = 0.10, 0.50
+RIPPLE_S = 0.9       # solve start / stop: the ripple crossing the area
+RIPPLE_FRONT, RIPPLE_TAIL = 0.035, 0.16   # ring: sharp leading edge, soft tail (fractions of the radius)
+RIPPLE_ALPHA = 0.42
 
 # ------------------------------------------------------------------- layout
 MARGIN = 16          # distance from the frame edge

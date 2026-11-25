@@ -1,17 +1,19 @@
-"""The AR start mat: a virtual mat lying on the table plane, drawn in perspective.
+"""The AR start area: a holographic mat lying on the table plane, drawn in perspective.
 
-* `Mat`: centre / angle / size in table centimetres (see plane.py for the frame).
-  Its projected outline is the timer's start zone.
-* `mat_texture`: an original mat graphic (graphite body with a soft rim and
-  sheen, two raised hand pads with hand outlines, an inset light strip in the
-  state colour, a status window with TrueType text) with one variant per timer
-  state. Colours come from theme.py, shared with the on-screen panels. No real
-  brand names or logos.
-* `ArMatRenderer`: warps the graphic onto the projected mat with
+* `Mat`: centre / angle / size in table centimetres (see plane.py for the frame),
+  optionally with a drawn outline (`shape`). Its projected outline is the
+  timer's start zone.
+* `mat_texture`: the holographic look, one variant per timer state: a glowing
+  outline, a faint grid lying on the table, light along the inside of the
+  edge, small corner marks on the rectangle. It is mostly transparent, so the
+  table shows through. Colours come from theme.py, shared with the on-screen
+  panels. Original artwork, no brand names or logos.
+* `ArMatRenderer`: warps the texture onto the projected area with
   cv2.warpPerspective and caches the result, so it only re-warps when the
-  plane, the mat or the state changes. Each frame it only composites:
-  states cross-fade, the holding fill grows smoothly, and the mat is cut away
-  where your hands are so they appear on top of it.
+  plane, the area or the state changes. Each frame it only composites:
+  states cross-fade, light runs round the edge while holding, the ready state
+  pulses softly, a ripple crosses the area when a solve starts or stops, and
+  the area is cut away where your hands are so they appear on top of it.
 * `hand_mask`: landmark-based hand shape plus skin-coloured pixels near the
   hands, with feathered edges.
 """
@@ -20,7 +22,7 @@ from __future__ import annotations
 import math
 import threading
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 import cv2
@@ -39,21 +41,47 @@ BONES = ((0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (5, 9),
 
 
 # ======================================================================= model
+Shape = tuple[tuple[float, float], ...]
+
+
 @dataclass(frozen=True)
 class Mat:
+    """The start area on the table: a rectangle, or a drawn outline (`shape`).
+
+    shape: the outline in cm relative to the centre, before rotation; the
+    centre is the middle of its bounding box, which is width_cm x height_cm.
+    """
+
     cx: float                 # centre on the table (cm)
     cy: float
     angle_deg: float = 0.0    # + = clockwise on screen
     width_cm: float = 30.0
     height_cm: float = 22.0
+    shape: Shape | None = None
 
-    def corners(self) -> np.ndarray:
-        """Table cm of the corners: far-left, far-right, near-right, near-left (as seen at angle 0)."""
+    @classmethod
+    def from_outline(cls, pts_cm, angle_deg: float = 0.0) -> "Mat":
+        """A drawn area from its outline in table cm (angle 0: the outline is used as it is)."""
+        p = np.asarray(pts_cm, dtype=np.float64).reshape(-1, 2)
+        lo, hi = p.min(axis=0), p.max(axis=0)
+        c = (lo + hi) / 2
+        local = tuple((round(float(x), 2), round(float(y), 2)) for x, y in p - c)
+        return cls(round(float(c[0]), 3), round(float(c[1]), 3), angle_deg, round(float(hi[0] - lo[0]), 2),
+                   round(float(hi[1] - lo[1]), 2), local)
+
+    def _to_table(self, local: np.ndarray) -> np.ndarray:
         a = math.radians(self.angle_deg)
         R = np.array([[math.cos(a), -math.sin(a)], [math.sin(a), math.cos(a)]])
+        return np.asarray(local, dtype=np.float64) @ R.T + (self.cx, self.cy)
+
+    def corners(self) -> np.ndarray:
+        """Table cm of the bounding-box corners: far-left, far-right, near-right, near-left (as seen at angle 0)."""
         w, h = self.width_cm / 2, self.height_cm / 2
-        local = np.array([(-w, -h), (w, -h), (w, h), (-w, h)])
-        return local @ R.T + (self.cx, self.cy)
+        return self._to_table(np.array([(-w, -h), (w, -h), (w, h), (-w, h)]))
+
+    def outline(self) -> np.ndarray:
+        """Table cm of the start area's outline (the 4 corners for a rectangle)."""
+        return self._to_table(np.array(self.shape)) if self.shape else self.corners()
 
     def moved_to(self, cx: float, cy: float) -> "Mat":
         return replace(self, cx=float(cx), cy=float(cy))
@@ -63,29 +91,39 @@ class Mat:
         return replace(self, angle_deg=round(a, 6))
 
     def image_quad(self, plane: TablePlane) -> np.ndarray | None:
-        """Projected corners in image px, or None if part of the mat is beyond the horizon."""
+        """Projected bounding-box corners in image px, or None if part of it is beyond the horizon."""
         quad, ok = plane.to_image(self.corners())
         if not ok.all():
             return None
         return quad
 
     def zone(self, plane: TablePlane) -> Zone | None:
-        quad = self.image_quad(plane)
-        if quad is None:
+        if self.image_quad(plane) is None:
             return None
-        return Zone(tuple(map(tuple, quad / np.array(plane.image_size, dtype=np.float64))))
+        pts, ok = plane.to_image(self.outline())
+        if not ok.all():
+            return None
+        return Zone(tuple(map(tuple, pts / np.array(plane.image_size, dtype=np.float64))))
 
     def to_config(self) -> dict:
-        return {"centre_cm": [round(self.cx, 3), round(self.cy, 3)], "angle_deg": round(self.angle_deg, 3),
-                "width_cm": round(self.width_cm, 3), "height_cm": round(self.height_cm, 3)}
+        d = {"centre_cm": [round(self.cx, 3), round(self.cy, 3)], "angle_deg": round(self.angle_deg, 3),
+             "width_cm": round(self.width_cm, 3), "height_cm": round(self.height_cm, 3)}
+        if self.shape:
+            d["shape_cm"] = [[round(x, 2), round(y, 2)] for x, y in self.shape]
+        return d
 
     @classmethod
     def from_config(cls, d: dict | None) -> "Mat | None":
         if not d or d.get("centre_cm") is None:
             return None
         cx, cy = d["centre_cm"]
+        shape = d.get("shape_cm")
+        if shape:
+            shape = tuple((float(x), float(y)) for x, y in shape)
+            if len(shape) < 3:
+                raise ValueError("shape_cm needs at least 3 points")
         return cls(float(cx), float(cy), float(d.get("angle_deg", 0.0)),
-                   float(d.get("width_cm", 30.0)), float(d.get("height_cm", 22.0)))
+                   float(d.get("width_cm", 30.0)), float(d.get("height_cm", 22.0)), shape or None)
 
 
 def mat_fits(mat: Mat, plane: TablePlane, max_extent: float = 3.0) -> bool:
@@ -142,34 +180,15 @@ def reanchor(mat: Mat, old: TablePlane, new: TablePlane) -> Mat | None:
     if not ok3.all():
         return None
     d = pts[1] - pts[0]
-    out = Mat(float(pts[0, 0]), float(pts[0, 1]), round(math.degrees(math.atan2(d[1], d[0])), 3),
-              mat.width_cm, mat.height_cm)
+    out = replace(mat, cx=float(pts[0, 0]), cy=float(pts[0, 1]), angle_deg=round(math.degrees(math.atan2(d[1], d[0])), 3))
     return out if mat_fits(out, new) else None
 
 
 # ===================================================================== texture
-def _rounded_rect_mask(shape, x0, y0, x1, y1, r, ss: int = 4) -> np.ndarray:
-    """Anti-aliased rounded rectangle (float 0..1) via supersampling."""
-    h, w = shape
-    big = np.zeros((h * ss, w * ss), np.uint8)
-    X0, Y0, X1, Y1, R = (int(round(v * ss)) for v in (x0, y0, x1, y1, r))
-    R = max(1, min(R, (X1 - X0) // 2, (Y1 - Y0) // 2))
-    cv2.rectangle(big, (X0 + R, Y0), (X1 - R, Y1), 255, -1)
-    cv2.rectangle(big, (X0, Y0 + R), (X1, Y1 - R), 255, -1)
-    for cx, cy in ((X0 + R, Y0 + R), (X1 - R, Y0 + R), (X0 + R, Y1 - R), (X1 - R, Y1 - R)):
-        cv2.circle(big, (cx, cy), R, 255, -1)
-    return cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-
-
-def _ring(shape, x0, y0, x1, y1, r, width) -> np.ndarray:
-    outer = _rounded_rect_mask(shape, x0, y0, x1, y1, r)
-    inner = _rounded_rect_mask(shape, x0 + width, y0 + width, x1 - width, y1 - width, max(0.5, r - width))
-    return np.clip(outer - inner, 0, 1)
-
-
-def _blend(img: np.ndarray, color, alpha: np.ndarray) -> None:
-    a = alpha[..., None]
-    img[:] = img * (1 - a) + np.array(color, np.float32) * a
+CORNER_CM = 2.0         # corner radius of the rectangular mat
+CORE_CM = 0.22          # outline width
+GRID_CM = 2.5           # grid spacing
+MAX_TEX_PX = 1600       # big drawn areas use fewer texture px per cm
 
 
 def rounded_rect_points(x0, y0, x1, y1, r, per_corner: int = 6) -> np.ndarray:
@@ -182,225 +201,217 @@ def rounded_rect_points(x0, y0, x1, y1, r, per_corner: int = 6) -> np.ndarray:
     return np.array(pts)
 
 
-def clip_below(poly: np.ndarray, y_top: float) -> np.ndarray:
-    """The part of a polygon with y >= y_top (Sutherland-Hodgman against one line)."""
-    out = []
-    n = len(poly)
-    for i in range(n):
-        cur, prev = poly[i], poly[i - 1]
-        cin, pin = cur[1] >= y_top, prev[1] >= y_top
-        if cin != pin:
-            t = (y_top - prev[1]) / (cur[1] - prev[1])
-            out.append(prev + t * (cur - prev))
-        if cin:
-            out.append(cur)
-    return np.array(out) if out else np.zeros((0, 2))
-
-
-def _hand_icon(shape, cx, cy, size, mirror: bool) -> np.ndarray:
-    """Outline of a simple open hand (palm + four fingers + thumb) as a soft line mask."""
-    h, w = shape
-    ss = 4
+def _poly_mask(hw, poly: np.ndarray, thickness: float = 0.0, closed: bool = True, ss: int = 4) -> np.ndarray:
+    """Anti-aliased filled polygon (thickness 0) or polyline, float32 0..1, via supersampling."""
+    h, w = hw
     big = np.zeros((h * ss, w * ss), np.uint8)
-    s = size * ss
-    sx = -1 if mirror else 1
-    X, Y = cx * ss, cy * ss
-
-    def P(x, y):
-        return (int(round(X + sx * x * s)), int(round(Y + y * s)))
-
-    # palm
-    cv2.ellipse(big, P(0.0, 0.18), (int(0.30 * s), int(0.30 * s)), 0, 0, 360, 255, -1)
-    cv2.rectangle(big, P(-0.30, 0.02), P(0.30, 0.30), 255, -1)
-    # fingers: (x, length, width)
-    for fx, ln, fw in ((-0.225, 0.42, 0.115), (-0.075, 0.50, 0.12), (0.075, 0.47, 0.115), (0.215, 0.37, 0.105)):
-        top = 0.02 - ln
-        tip = fx * 1.35                       # fingers fan out a little
-        cv2.line(big, P(fx, 0.04), P(tip, top), 255, int(fw * s))
-        cv2.circle(big, P(tip, top), int(fw * s / 2), 255, -1)
-    # thumb, angled out to the side
-    cv2.line(big, P(-0.26, 0.30), P(-0.50, 0.02), 255, int(0.14 * s))
-    cv2.circle(big, P(-0.50, 0.02), int(0.07 * s), 255, -1)
-    filled = cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-    edge = filled - cv2.erode(filled, np.ones((3, 3), np.uint8), iterations=max(1, int(round(size * 0.035))))
-    return np.clip(edge * 1.4, 0, 1)
+    pts = np.int32(np.round(np.asarray(poly, dtype=np.float64) * ss * 16))
+    if thickness > 0:
+        cv2.polylines(big, [pts], closed, 255, max(1, int(round(thickness * ss))), cv2.LINE_AA, shift=4)
+    else:
+        cv2.fillPoly(big, [pts], 255, cv2.LINE_AA, shift=4)
+    return cv2.resize(big, (w, h), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
 
 
-_TEX_BASE: dict = {}
+def _shape_key(shape) -> tuple | None:
+    return None if not shape else tuple((round(float(x), 2), round(float(y), 2)) for x, y in shape)
+
+
+_TEX_BASE: "OrderedDict[tuple, dict]" = OrderedDict()
 _TEX: "OrderedDict[tuple, tuple[np.ndarray, tuple]]" = OrderedDict()
 _TEX_LOCK = threading.RLock()   # textures are also built by the renderer's helper thread
 
 
 @dataclass(frozen=True)
 class MatLayout:
-    """Where things are in the texture (texture pixels)."""
+    """Where the area is in its texture (texture pixels)."""
 
-    rect: tuple[float, float, float, float]          # the mat itself (x0, y0, x1, y1)
-    pads: tuple[tuple[float, float, float, float], ...]
-    pad_radius: float
-    window: tuple[float, float, float, float]
-    strip: tuple[float, float, float, float]          # the inset light strip's outer rectangle
+    rect: tuple[float, float, float, float]          # the bounding box (x0, y0, x1, y1)
     size: tuple[int, int]                              # texture (w, h)
+    ppc: int                                           # texture px per cm
+    outline: np.ndarray = field(compare=False, repr=False)   # (N, 2) the area's outline
+    rounded: bool = True                               # the default rectangle (rounded corners, corner marks)
 
 
-def mat_layout(w_cm: float, h_cm: float, ppc: int = PX_PER_CM) -> MatLayout:
+def texture_ppc(w_cm: float, h_cm: float, ppc: int = PX_PER_CM) -> int:
+    return int(max(4, min(ppc, MAX_TEX_PX // (max(w_cm, h_cm) + 2 * MARGIN_CM))))
+
+
+def mat_layout(w_cm: float, h_cm: float, ppc: int = PX_PER_CM, shape: Shape | None = None) -> MatLayout:
+    ppc = texture_ppc(w_cm, h_cm, ppc)
     m = MARGIN_CM * ppc
     W, H = int(round((w_cm + 2 * MARGIN_CM) * ppc)), int(round((h_cm + 2 * MARGIN_CM) * ppc))
     x0, y0, x1, y1 = m, m, W - m, H - m
-    mw, mh = x1 - x0, y1 - y0
-    pw, ph = 0.38 * mw, 0.60 * mh
-    pads = tuple((x0 + fx * mw - pw / 2, y0 + 0.61 * mh - ph / 2, x0 + fx * mw + pw / 2, y0 + 0.61 * mh + ph / 2)
-                 for fx in (0.255, 0.745))
-    sw, sh = 0.30 * mw, 0.15 * mh
-    window = (x0 + mw / 2 - sw / 2, y0 + 0.075 * mh, x0 + mw / 2 + sw / 2, y0 + 0.075 * mh + sh)
-    inset = 0.9 * ppc
-    strip = (x0 + inset, y0 + inset, x1 - inset, y1 - inset)
-    return MatLayout((x0, y0, x1, y1), pads, 2.4 * ppc, window, strip, (W, H))
+    if shape:
+        outline = (chaikin(np.asarray(shape, dtype=np.float64)) + (w_cm / 2, h_cm / 2)) * ppc + m
+    else:
+        outline = rounded_rect_points(x0, y0, x1, y1, CORNER_CM * ppc, per_corner=12)
+    return MatLayout((x0, y0, x1, y1), (W, H), ppc, outline, not shape)
 
 
-def _base_layers(w_cm: float, h_cm: float, ppc: int):
-    """State-independent parts of the texture (cached per size)."""
-    key = (round(w_cm, 2), round(h_cm, 2), ppc)
-    if key in _TEX_BASE:
-        return _TEX_BASE[key]
-    L = mat_layout(w_cm, h_cm, ppc)
+def chaikin(poly: np.ndarray, iterations: int = 2) -> np.ndarray:
+    """Corner cutting: a closed polygon drawn as a smooth curve (for display; the zone keeps the polygon)."""
+    p = np.asarray(poly, dtype=np.float64)
+    for _ in range(iterations):
+        q = np.roll(p, -1, axis=0)
+        p = np.stack([0.75 * p + 0.25 * q, 0.25 * p + 0.75 * q], axis=1).reshape(-1, 2)
+    return p
+
+
+def _arc_map(hw, outline: np.ndarray) -> np.ndarray:
+    """For every texel: how far round the outline its nearest outline point is, 0..1.
+
+    0 at the middle of the near edge (closest to you), 1 at the opposite
+    point, counted both ways round, so a fill up to `progress` grows round
+    both sides and meets at the far side.
+    """
+    h, w = hw
+    closed = np.vstack([outline, outline[:1]])
+    seg = np.linalg.norm(np.diff(closed, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(seg)])
+    perim = float(cum[-1])
+    n = max(16, int(perim / 0.7))
+    t = np.linspace(0.0, perim, n, endpoint=False)
+    pts = np.column_stack([np.interp(t, cum, closed[:, 0]), np.interp(t, cum, closed[:, 1])])
+    span = pts[:, 1].max() - pts[:, 1].min()
+    near = pts[:, 1] >= pts[:, 1].max() - 0.01 * span
+    cx = pts[:, 0].mean()
+    start = int(np.flatnonzero(near)[np.argmin(np.abs(pts[near, 0] - cx))])
+    arc = (t - t[start]) % perim
+    frac = (np.minimum(arc, perim - arc) / (perim / 2)).astype(np.float32)
+    xs = np.clip(np.round(pts[:, 0]).astype(int), 0, w - 1)
+    ys = np.clip(np.round(pts[:, 1]).astype(int), 0, h - 1)
+    seeds = np.ones((h, w), np.uint8)
+    seeds[ys, xs] = 0
+    _, labels = cv2.distanceTransformWithLabels(seeds, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    lut = np.zeros(int(labels.max()) + 1, np.float32)
+    lut[labels[ys, xs]] = frac
+    return lut[labels]
+
+
+def _base_layers(w_cm: float, h_cm: float, ppc: int, shape: Shape | None = None) -> dict:
+    """State-independent layers of the area (cached per size and shape)."""
+    key = (round(w_cm, 2), round(h_cm, 2), ppc, _shape_key(shape))
+    with _TEX_LOCK:
+        if key in _TEX_BASE:
+            _TEX_BASE.move_to_end(key)
+            return _TEX_BASE[key]
+        out = _make_base_layers(w_cm, h_cm, ppc, shape)
+        _TEX_BASE[key] = out
+        while len(_TEX_BASE) > 6:
+            _TEX_BASE.popitem(last=False)
+        return out
+
+
+def _make_base_layers(w_cm, h_cm, ppc, shape) -> dict:
+    L = mat_layout(w_cm, h_cm, ppc, shape)
+    p = L.ppc
     W, H = L.size
+    hw = (H, W)
+    inside = _poly_mask(hw, L.outline)
+    core = _poly_mask(hw, L.outline, thickness=CORE_CM * p)
+    glow = np.clip(cv2.GaussianBlur(core, (0, 0), 0.45 * p) * 2.2, 0, 1)
+    haze = np.clip(cv2.GaussianBlur(core, (0, 0), 1.3 * p) * 1.8, 0, 1)
+    d_in = cv2.distanceTransform((inside > 0.5).astype(np.uint8), cv2.DIST_L2, 5)
+    edge_light = np.exp(-d_in / (1.2 * p)) * inside                  # light just inside the outline
+    # the faint grid, aligned with the area, a little stronger towards the outline
     x0, y0, x1, y1 = L.rect
-    shape = (H, W)
-    rng = np.random.default_rng(7)
-    radius = 3.0 * ppc
-
-    body = _rounded_rect_mask(shape, x0, y0, x1, y1, radius)
-    color = np.empty((H, W, 3), np.float32)
-    # graphite with a soft light fall-off from the far edge, plus a faint diagonal sheen
-    v = np.clip((np.arange(H, dtype=np.float32)[:, None] - y0) / max(1.0, y1 - y0), 0, 1)[..., None]
-    u = np.clip((np.arange(W, dtype=np.float32)[None, :] - x0) / max(1.0, x1 - x0), 0, 1)[..., None]
-    top, bot = np.array(T.MAT_BODY_TOP, np.float32), np.array(T.MAT_BODY_BOTTOM, np.float32)
-    color[:] = top * (1 - v) + bot * v
-    color += (6.0 * np.exp(-((u - 0.3) * 1.6 + (v - 0.2) * 1.2) ** 2 * 3.0))
-    grain = cv2.GaussianBlur(rng.normal(0, 1, shape).astype(np.float32), (0, 0), 0.7)
-    color += grain[..., None] * 2.2
-    # rim: a darker edge band and a fine highlight on its inside, brightest along the far edge
-    _blend(color, T.MAT_RIM, _ring(shape, x0, y0, x1, y1, radius, 0.42 * ppc) * 0.9)
-    hl = _ring(shape, x0 + 0.42 * ppc, y0 + 0.42 * ppc, x1 - 0.42 * ppc, y1 - 0.42 * ppc,
-               radius - 0.42 * ppc, 0.07 * ppc)
-    _blend(color, T.MAT_HIGHLIGHT, hl * (0.25 + 0.45 * (1 - v[..., 0])))
-
-    # hand pads: slightly raised, with a soft inner shadow at the far side and a hand outline
-    pad_masks = []
-    for i, (px0, py0, px1, py1) in enumerate(L.pads):
-        pm = _rounded_rect_mask(shape, px0, py0, px1, py1, L.pad_radius)
-        pad_masks.append(pm)
-        pv = np.clip((np.arange(H, dtype=np.float32)[:, None] - py0) / max(1.0, py1 - py0), 0, 1)
-        shade = np.array(T.MAT_PAD, np.float32) * (0.94 + 0.10 * pv[..., None])
-        color = color * (1 - pm[..., None]) + shade * pm[..., None]
-        inner = np.clip(pm - np.roll(pm, int(0.22 * ppc), axis=0), 0, 1)       # far-side inner shadow
-        _blend(color, T.MAT_RIM, inner * 0.55)
-        _blend(color, T.MAT_PAD_EDGE, _ring(shape, px0, py0, px1, py1, L.pad_radius, 0.06 * ppc) * 0.8)
-    icons = []
-    for i, (px0, py0, px1, py1) in enumerate(L.pads):
-        icon = _hand_icon(shape, (px0 + px1) / 2, (py0 + py1) / 2 + 0.05 * (py1 - py0), 0.62 * (py1 - py0),
-                          mirror=(i == 0))
-        icons.append(icon)
-        _blend(color, T.MAT_ICON, icon * 0.75)
-
-    # status window
-    wx0, wy0, wx1, wy1 = L.window
-    win = _rounded_rect_mask(shape, *L.window, (wy1 - wy0) / 2)
-    _blend(color, T.MAT_WINDOW, win)
-    _blend(color, T.MAT_HIGHLIGHT, _ring(shape, *L.window, (wy1 - wy0) / 2, 0.05 * ppc) * 0.35)
-
-    out = (body, color, pad_masks, icons, L)
-    _TEX_BASE[key] = out
-    return out
+    gx, gy = (x0 + x1) / 2, (y0 + y1) / 2
+    step = GRID_CM * p
+    xs = gx + step * np.arange(-int(W / step) - 1, int(W / step) + 2)
+    ys = gy + step * np.arange(-int(H / step) - 1, int(H / step) + 2)
+    lines = np.zeros(hw, np.uint8)
+    for x in xs:
+        cv2.line(lines, (int(round(x * 16)), 0), (int(round(x * 16)), H * 16), 255, 1, cv2.LINE_AA, shift=4)
+    for y in ys:
+        cv2.line(lines, (0, int(round(y * 16))), (W * 16, int(round(y * 16))), 255, 1, cv2.LINE_AA, shift=4)
+    dots = np.zeros(hw, np.uint8)
+    r_dot = max(1, int(0.09 * p * 16))
+    for x in xs:
+        for y in ys:
+            cv2.circle(dots, (int(round(x * 16)), int(round(y * 16))), r_dot, 255, -1, cv2.LINE_AA, shift=4)
+    grid = np.maximum(lines.astype(np.float32) * (0.75 / 255.0), dots.astype(np.float32) / 255.0)
+    fade = 0.45 + 0.55 * np.exp(-d_in / (5.0 * p))
+    grid *= inside * fade * np.clip(d_in / (0.6 * p), 0, 1)           # keep clear of the outline itself
+    marks = None
+    if L.rounded:
+        # small corner marks just outside the rectangle, like the frame in a viewfinder
+        o, arm = 0.55 * p, 2.2 * p
+        segs = []
+        for cx, cy, sx, sy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x1, y1, -1, -1), (x0, y1, 1, -1)):
+            c = np.array([cx - sx * o, cy - sy * o])
+            segs.append(np.array([c + (sx * arm, 0), c, c + (0, sy * arm)]))
+        marks = np.maximum.reduce([_poly_mask(hw, sg, thickness=0.12 * p, closed=False) for sg in segs])
+    # maps for the per-frame light effects
+    edge = np.clip(core + 0.9 * glow + 0.45 * haze, 0, 1)
+    arc = _arc_map(hw, L.outline)
+    m = cv2.moments((inside > 0.5).astype(np.uint8), binaryImage=True)
+    c = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]]) if m["m00"] else np.array([gx, gy])
+    rmax = float(np.linalg.norm(L.outline - c, axis=1).max())
+    Y, X = np.mgrid[0:H, 0:W].astype(np.float32)
+    radial = (np.sqrt((X - c[0]) ** 2 + (Y - c[1]) ** 2) / max(rmax, 1.0)).astype(np.float32)
+    return dict(layout=L, inside=inside, core=core, glow=glow, haze=haze, edge_light=edge_light, grid=grid,
+                marks=marks, edge=edge, arc=arc, radial=radial)
 
 
-STATE_TEXT = {"idle": "PLACE HANDS", "holding": "HOLD STILL", "ready": "READY", "solving": "SOLVING"}
+def _mix(a, b, t: float) -> np.ndarray:
+    return np.array(a, np.float32) * (1 - t) + np.array(b, np.float32) * t
 
 
 def mat_texture(w_cm: float, h_cm: float, state: str = "idle", progress: float = 0.0,
-                ppc: int = PX_PER_CM) -> tuple[np.ndarray, tuple[float, float, float, float]]:
-    """(BGRA uint8 texture, mat rectangle (x0, y0, x1, y1) inside it in texture px).
+                ppc: int = PX_PER_CM, shape: Shape | None = None) -> tuple[np.ndarray, tuple[float, float, float, float]]:
+    """(BGRA uint8 texture, bounding box (x0, y0, x1, y1) of the area inside it, in texture px).
 
-    The holding fill is normally drawn per frame by ArMatRenderer (smooth);
+    The holding light is normally drawn per frame by ArMatRenderer (smooth);
     a progress > 0 here bakes it in (for still pictures).
     """
     with _TEX_LOCK:
-        return _mat_texture(w_cm, h_cm, state, progress, ppc)
+        return _mat_texture(w_cm, h_cm, state, progress, ppc, shape)
 
 
-def _mat_texture(w_cm, h_cm, state, progress, ppc):
+def _mat_texture(w_cm, h_cm, state, progress, ppc, shape):
     if state not in STATES:
         state = "idle"
     level = round(min(max(progress, 0.0), 1.0), 3) if state == "holding" else 0.0
-    key = (round(w_cm, 2), round(h_cm, 2), ppc, state, level)
+    key = (round(w_cm, 2), round(h_cm, 2), ppc, _shape_key(shape), state, level)
     if key in _TEX:
         _TEX.move_to_end(key)
         return _TEX[key]
-    body, base_color, pad_masks, icons, L = _base_layers(w_cm, h_cm, ppc)
-    color = base_color.copy()
-    alpha = body.copy()
-    shape = body.shape
-    accent = T.STATE[state]
-    pad_union = np.maximum.reduce(pad_masks)
-    icon_union = np.maximum.reduce(icons)
-    sx0, sy0, sx1, sy1 = L.strip
-    strip = _ring(shape, sx0, sy0, sx1, sy1, 2.2 * ppc, 0.16 * ppc)
-    strength = {"idle": 0.30, "holding": 0.85, "ready": 1.0, "solving": 0.75}[state]
-    if state != "idle":
-        # the strip glows a little into the rubber round it
-        _blend(color, accent, np.clip(cv2.GaussianBlur(strip, (0, 0), 0.35 * ppc) * 1.2, 0, 1) * 0.35 * strength)
-    _blend(color, accent, strip * strength)
-    if state == "holding":
-        _blend(color, accent, icon_union * 0.6)
-        if level > 0:
-            fill = np.zeros(shape, np.float32)
-            for (px0, py0, px1, py1), pm in zip(L.pads, pad_masks):
-                top = py1 - level * (py1 - py0)
-                fill[int(top):int(math.ceil(py1)) + 1, int(px0):int(math.ceil(px1)) + 1] = 1.0
-            _blend(color, accent, fill * pad_union * 0.42)
-    elif state == "ready":
-        _blend(color, accent, pad_union * 0.30)
-        _blend(color, accent, icon_union * 0.9)
-        glow = cv2.GaussianBlur(body, (0, 0), 1.0 * ppc)
-        outside = np.clip(glow * 1.5 - body, 0, 1) * 0.6
-        color = color * body[..., None] + np.array(accent, np.float32) * (1 - body[..., None])
-        alpha = np.maximum(body, outside)
-    elif state == "solving":
-        _blend(color, accent, pad_union * 0.08)
-    # status text (TrueType) in the window, with a small state dot
-    from gfx import text_mask
+    b = _base_layers(w_cm, h_cm, ppc, shape)
+    lv = T.HOLO[state]
+    col = np.array(T.HOLO_COLOR[state], np.float32)
+    H, W = b["inside"].shape
+    P = np.zeros((H, W, 3), np.float32)          # premultiplied colour
+    A = np.zeros((H, W), np.float32)
 
-    wx0, wy0, wx1, wy1 = L.window
-    text = STATE_TEXT[state]
-    px = int((wy1 - wy0) * 0.46)
-    m = text_mask(text, "semibold", px).astype(np.float32) / 255.0
-    dot_r = (wy1 - wy0) * 0.12
-    gap = dot_r * 2.2
-    tw = m.shape[1] + gap + 2 * dot_r
-    scale = min(1.0, (wx1 - wx0) * 0.84 / tw)
-    if scale < 1.0:
-        m = cv2.resize(m, (max(1, int(m.shape[1] * scale)), max(1, int(m.shape[0] * scale))),
-                       interpolation=cv2.INTER_AREA)
-        tw = m.shape[1] + gap + 2 * dot_r
-    tx = int((wx0 + wx1 - tw) / 2 + 2 * dot_r + gap)
-    ty = int((wy0 + wy1 - m.shape[0]) / 2)
-    canvas = np.zeros(shape, np.float32)
-    canvas[ty:ty + m.shape[0], tx:tx + m.shape[1]] = m[:max(0, min(m.shape[0], shape[0] - ty)),
-                                                       :max(0, min(m.shape[1], shape[1] - tx))]
-    text_col = T.TEXT_MUTED if state == "idle" else accent
-    _blend(color, text_col, canvas)
-    dot = np.zeros(shape, np.uint8)
-    cv2.circle(dot, (int(round((wx0 + wx1 - tw) / 2 + dot_r) * 4), int(round((wy0 + wy1) / 2 * 4))),
-               int(round(dot_r * 4)), 255, -1, cv2.LINE_AA, shift=2)
-    _blend(color, accent if state != "idle" else T.TEXT_FAINT, dot.astype(np.float32) / 255.0)
+    def over(color, alpha):
+        nonlocal P, A
+        a = np.clip(alpha, 0, 1).astype(np.float32)
+        P = P * (1 - a)[..., None] + np.asarray(color, np.float32) * a[..., None]
+        A = a + A * (1 - a)
 
-    tex = np.dstack([np.clip(color, 0, 255), np.clip(alpha * 255, 0, 255)]).astype(np.uint8)
-    out = (tex, L.rect)
+    over(T.PANEL, b["inside"] * lv["fill"])
+    over(col, b["edge_light"] * lv["edge"])
+    over(col, b["haze"] * lv["haze"])
+    over(col, b["grid"] * lv["grid"])
+    over(col, b["glow"] * lv["glow"])
+    if b["marks"] is not None:
+        over(col, b["marks"] * lv["core"] * 0.75)
+    over(_mix(col, T.TEXT, T.HOT_MIX), b["core"] * lv["core"])
+    if level > 0:
+        over(hold_color(), b["edge"] * np.clip((level * 1.04 - b["arc"]) / 0.04, 0, 1) * T.HOLD_LIGHT)
+    color = P / np.maximum(A, 1e-4)[..., None]
+    tex = np.dstack([np.clip(color, 0, 255), np.clip(A * 255, 0, 255)]).astype(np.uint8)
+    out = (tex, b["layout"].rect)
     _TEX[key] = out
     while len(_TEX) > 48:
         _TEX.popitem(last=False)
     return out
+
+
+def hold_color() -> tuple[int, int, int]:
+    """The light that runs round the outline while holding: amber, a little brighter."""
+    return tuple(int(v) for v in np.round(_mix(T.STATE["holding"], T.TEXT, 0.35)))
 
 
 # =================================================================== hand mask
@@ -503,28 +514,42 @@ class _Warp:
     color: np.ndarray      # uint8 (h, w, 3), not premultiplied
     alpha: np.ndarray      # float32 (h, w), 0..1
     inv_alpha: np.ndarray  # float32 (h, w), 1 - alpha
-    tex_to_roi: np.ndarray  # 3x3: full-resolution texture px -> ROI px
-    layout: MatLayout
 
 
-def warp_mat(quad: np.ndarray, size_cm: tuple[float, float], state: str, level: float,
-             frame_wh: tuple[int, int], ppc: int = PX_PER_CM) -> _Warp | None:
-    """Warp the mat texture onto the image quad (far-left, far-right, near-right, near-left), cropped to its box."""
-    tex, (x0, y0, x1, y1) = mat_texture(size_cm[0], size_cm[1], state, level, ppc)
-    layout = mat_layout(size_cm[0], size_cm[1], ppc)
+RADIAL_STEPS = 200      # radial map: 8-bit levels per area radius (0..255 covers 0..1.27)
+
+
+@dataclass
+class _Lights:
+    """State-independent maps for the per-frame light effects, warped and cropped like the _Warp.
+
+    arc and radial are 8-bit, so each frame turns them into light with one
+    cv2.LUT pass (a 256-entry table for the current progress / ripple radius)
+    instead of several float operations over the whole area.
+    """
+
+    x0: int
+    y0: int
+    edge: np.ndarray       # float32: where the outline's light lives (0..1)
+    arc: np.ndarray        # uint8: how far round the outline, 0 (near edge middle) .. 255 (far side)
+    radial: np.ndarray     # uint8: distance from the area's centre x RADIAL_STEPS (1 = furthest outline point)
+    ripple: np.ndarray     # float32: what a ripple lights up (the area, a little more on the outline)
+
+
+def _warp_geometry(quad, rect, tex_wh, frame_wh):
+    """(shrink factor, shrunk texture size, texture->ROI matrix, ROI box) or None if off-screen."""
+    x0, y0, x1, y1 = rect
     src = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
     H_full = cv2.getPerspectiveTransform(src, np.float32(quad)).astype(np.float64)
-    Hq = H_full
-    # pre-shrink the texture when the mat is small on screen (avoids aliasing)
+    # pre-shrink the texture when the area is small on screen (avoids aliasing)
     on_screen = max(np.linalg.norm(quad[1] - quad[0]), np.linalg.norm(quad[2] - quad[3]))
     f = 1.0
     while on_screen / ((x1 - x0) * f) < 0.6 and f > 0.2:
         f *= 0.5
+    tw, th = tex_wh
     if f < 1.0:
-        tex = cv2.resize(tex, (max(2, int(tex.shape[1] * f)), max(2, int(tex.shape[0] * f))),
-                         interpolation=cv2.INTER_AREA)
-        Hq = H_full @ np.diag([1 / f, 1 / f, 1.0])
-    th, tw = tex.shape[:2]
+        tw, th = max(2, int(tw * f)), max(2, int(th * f))
+    Hq = H_full @ np.diag([1 / f, 1 / f, 1.0])
     outer = cv2.perspectiveTransform(np.float32([[[0, 0]], [[tw, 0]], [[tw, th]], [[0, th]]]), Hq).reshape(-1, 2)
     W, H = frame_wh
     bx0, by0 = int(max(0, np.floor(outer[:, 0].min()))), int(max(0, np.floor(outer[:, 1].min())))
@@ -532,39 +557,79 @@ def warp_mat(quad: np.ndarray, size_cm: tuple[float, float], state: str, level: 
     if bx1 <= bx0 or by1 <= by0:
         return None
     Tr = np.array([[1, 0, -bx0], [0, 1, -by0], [0, 0, 1]], np.float64)
+    return f, (tw, th), Tr @ Hq, (bx0, by0, bx1, by1)
+
+
+def warp_mat(quad: np.ndarray, size_cm: tuple[float, float], state: str, level: float,
+             frame_wh: tuple[int, int], ppc: int = PX_PER_CM, shape: Shape | None = None) -> _Warp | None:
+    """Warp the area's texture onto the image quad (its bounding box: far-left, far-right, near-right, near-left)."""
+    tex, rect = mat_texture(size_cm[0], size_cm[1], state, level, ppc, shape)
+    g = _warp_geometry(np.asarray(quad, dtype=np.float64), rect, (tex.shape[1], tex.shape[0]), frame_wh)
+    if g is None:
+        return None
+    f, (tw, th), M, (bx0, by0, bx1, by1) = g
+    if f < 1.0:
+        tex = cv2.resize(tex, (tw, th), interpolation=cv2.INTER_AREA)
     # premultiply first so the edges blend correctly after interpolation
     a = tex[..., 3:4].astype(np.float32) / 255.0
     pm = np.dstack([tex[..., :3].astype(np.float32) * a, a[..., 0] * 255.0])
-    warped = cv2.warpPerspective(pm, Tr @ Hq, (bx1 - bx0, by1 - by0), flags=cv2.INTER_LINEAR,
+    warped = cv2.warpPerspective(pm, M, (bx1 - bx0, by1 - by0), flags=cv2.INTER_LINEAR,
                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
     alpha = np.ascontiguousarray(warped[..., 3] / 255.0, dtype=np.float32)
     color = np.clip(warped[..., :3] / np.maximum(alpha, 1e-4)[..., None], 0, 255).astype(np.uint8)
-    return _Warp(bx0, by0, color, alpha, np.ascontiguousarray(1.0 - alpha), Tr @ H_full, layout)
+    return _Warp(bx0, by0, color, alpha, np.ascontiguousarray(1.0 - alpha))
 
 
-def _variants() -> list[tuple[str, float]]:
-    return [(s, 0.0) for s in STATES]
+def warp_lights(quad: np.ndarray, size_cm: tuple[float, float], frame_wh: tuple[int, int],
+                ppc: int = PX_PER_CM, shape: Shape | None = None) -> _Lights | None:
+    """Warp the light-effect maps exactly like warp_mat warps the texture."""
+    b = _base_layers(size_cm[0], size_cm[1], ppc, shape)
+    stack = np.dstack([b["edge"], b["arc"], b["radial"], b["inside"]]).astype(np.float32)
+    g = _warp_geometry(np.asarray(quad, dtype=np.float64), b["layout"].rect, (stack.shape[1], stack.shape[0]),
+                       frame_wh)
+    if g is None:
+        return None
+    f, (tw, th), M, (bx0, by0, bx1, by1) = g
+    if f < 1.0:
+        stack = cv2.resize(stack, (tw, th), interpolation=cv2.INTER_AREA)
+    warped = cv2.warpPerspective(stack, M, (bx1 - bx0, by1 - by0), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    edge = np.ascontiguousarray(warped[..., 0])
+    arc = np.clip(np.round(warped[..., 1] * 255), 0, 255).astype(np.uint8)
+    radial = np.clip(np.round(warped[..., 2] * RADIAL_STEPS), 0, 255).astype(np.uint8)
+    ripple = np.ascontiguousarray(warped[..., 3] * 0.6 + edge * 0.4, dtype=np.float32)
+    return _Lights(bx0, by0, edge, arc, radial, ripple)
+
+
+_LEVELS = np.arange(256, dtype=np.float32) / 255.0     # the 8-bit map levels as 0..1
+
+
+def _approach(cur: float, target: float, step: float) -> float:
+    return min(target, cur + step) if cur < target else max(target, cur - step)
 
 
 class ArMatRenderer:
-    """Draws the mat into frames.
+    """Draws the holographic start area into frames.
 
-    Warps are cached per (quad, size, state). When a mat position is first
-    seen, the current state is warped right away (a few ms) and the other
-    states are prepared in a background thread, so a later state change never
-    stalls the frame loop. Each frame then only composites:
+    Warps are cached per (quad, size, shape, state). When an area position is
+    first seen, the current state is warped right away (a few ms) and the
+    other states, plus the light-effect maps, are prepared in a background
+    thread, so a later state change never stalls the frame loop. Each frame
+    then only composites:
       * state changes cross-fade over theme.FADE_S (no hard switch);
-      * the holding progress fills the hand pads continuously (drawn per frame
-        in perspective, not as stepped textures);
-      * the mat is cut away under the hands.
+      * holding: light runs round the outline as the hold progresses;
+      * ready: a soft pulse of the outline's glow;
+      * solve start / stop: a ripple spreads across the area;
+      * the area is cut away under the hands.
+    With animate=False (still pictures) there are no fades, pulses or ripples.
     """
 
-    def __init__(self, ppc: int = PX_PER_CM, cache_size: int = 32, background: bool = True, animate: bool = True):
+    def __init__(self, ppc: int = PX_PER_CM, cache_size: int = 40, background: bool = True, animate: bool = True):
         self.ppc = ppc
         self.cache_size = cache_size
         self.background = background
         self.animate = animate
-        self._cache: "OrderedDict[tuple, _Warp | None]" = OrderedDict()
+        self._cache: "OrderedDict[tuple, object]" = OrderedDict()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._todo: list[tuple] = []
@@ -572,17 +637,24 @@ class ArMatRenderer:
         self._thread = None
         self.warps = 0          # how many warps were made (tests / profiling)
         self.last_ms = 0.0
-        self._bg: np.ndarray | None = None     # clean picture of the mat region (no hands)
+        self._bg: np.ndarray | None = None     # clean picture of the area's region (no hands)
         self._bg_box: tuple | None = None
         self._shown: tuple | None = None       # (quad key, state, warp) drawn last frame
         self._fade: tuple | None = None        # (previous warp, start time) while cross-fading
         self._progress = 0.0
+        self._state: str | None = None         # the state asked for last frame
+        self._last_now: float | None = None
+        self._hold_vis = 0.0                   # light effects fade in / out with their state
+        self._ready_vis = 0.0
+        self._ready_t0 = 0.0
+        self._ripple: tuple | None = None      # (start time, colour)
+        self._solid: dict = {}
 
     # ----------------------------------------------------------------- cache
     @staticmethod
-    def _qkey(quad, size_cm, frame_wh):
+    def _qkey(quad, size_cm, frame_wh, shape=None):
         return (tuple(np.round(np.asarray(quad).ravel() * 4).astype(int)), round(size_cm[0], 2),
-                round(size_cm[1], 2), tuple(frame_wh))
+                round(size_cm[1], 2), tuple(frame_wh), _shape_key(shape))
 
     def _store(self, key, value) -> None:
         with self._lock:
@@ -599,16 +671,22 @@ class ArMatRenderer:
                 return True, self._cache[key]
             return False, None
 
-    def _queue_rest(self, quad, size_cm, frame_wh) -> None:
-        jobs = [(quad.copy(), size_cm, st, lv, frame_wh) for st, lv in _variants()]
+    def _make(self, job):
+        quad, size_cm, what, frame_wh, shape = job
+        if what == "lights":
+            return warp_lights(quad, size_cm, frame_wh, self.ppc, shape)
+        return warp_mat(quad, size_cm, what, 0.0, frame_wh, self.ppc, shape)
+
+    def _queue_rest(self, quad, size_cm, frame_wh, shape) -> None:
+        jobs = [(quad.copy(), size_cm, what, frame_wh, shape) for what in STATES + ("lights",)]
         if not self.background:
             for job in jobs:
-                k = self._qkey(job[0], size_cm, frame_wh) + (job[2],)
+                k = self._qkey(job[0], size_cm, frame_wh, shape) + (job[2],)
                 if not self._get(k)[0]:
-                    self._store(k, warp_mat(*job, ppc=self.ppc))
+                    self._store(k, self._make(job))
             return
         with self._cond:
-            self._todo = jobs          # newest mat position first; drop work for older positions
+            self._todo = jobs          # newest area position first; drop work for older positions
             if self._thread is None:
                 self._thread = threading.Thread(target=self._loop, name="ar-mat", daemon=True)
                 self._thread.start()
@@ -621,31 +699,48 @@ class ArMatRenderer:
                     self._cond.wait(0.5)
                 if not self._running:
                     return
-                quad, size_cm, st, lv, frame_wh = self._todo.pop(0)
-            k = self._qkey(quad, size_cm, frame_wh) + (st,)
+                job = self._todo.pop(0)
+            k = self._qkey(job[0], job[1], job[3], job[4]) + (job[2],)
             if self._get(k)[0]:
                 continue
             try:
-                self._store(k, warp_mat(quad, size_cm, st, lv, frame_wh, self.ppc))
+                self._store(k, self._make(job))
             except Exception:  # pragma: no cover - never let the helper thread die on a bad quad
                 pass
 
-    def warp_for(self, quad, size_cm, state, frame_wh) -> tuple[_Warp | None, str]:
+    def warp_for(self, quad, size_cm, state, frame_wh, shape=None) -> tuple[_Warp | None, str]:
         """The warp to show for this state (or the idle one while it's being prepared)."""
         if state not in STATES:
             state = "idle"
-        qk = self._qkey(quad, size_cm, frame_wh)
+        qk = self._qkey(quad, size_cm, frame_wh, shape)
         found, wp = self._get(qk + (state,))
         if found:
             return wp, state
         found_idle, idle = self._get(qk + ("idle",))
         if found_idle and self.background:
-            self._queue_rest(quad, size_cm, frame_wh)
+            self._queue_rest(quad, size_cm, frame_wh, shape)
             return idle, "idle"
-        wp = warp_mat(quad, size_cm, state, 0.0, frame_wh, self.ppc)
+        wp = warp_mat(quad, size_cm, state, 0.0, frame_wh, self.ppc, shape)
         self._store(qk + (state,), wp)
-        self._queue_rest(quad, size_cm, frame_wh)
+        self._queue_rest(quad, size_cm, frame_wh, shape)
         return wp, state
+
+    def lights_for(self, quad, size_cm, frame_wh, shape=None) -> _Lights | None:
+        """The light-effect maps, or None while the background thread prepares them."""
+        k = self._qkey(quad, size_cm, frame_wh, shape) + ("lights",)
+        found, lt = self._get(k)
+        if found:
+            return lt
+        job = (np.asarray(quad, dtype=np.float64).copy(), size_cm, "lights", frame_wh, shape)
+        if not self.background:
+            lt = self._make(job)
+            self._store(k, lt)
+            return lt
+        with self._cond:
+            if not any(j[2] == "lights" and self._qkey(j[0], j[1], j[3], j[4]) == k[:-1] for j in self._todo):
+                self._todo.append(job)
+                self._cond.notify()
+        return None
 
     def wait_idle(self, timeout: float = 10.0) -> None:
         """Block until the background thread has nothing left to do (tests, screenshots)."""
@@ -665,54 +760,108 @@ class ArMatRenderer:
             self._cond.notify()
 
     # ------------------------------------------------------------------ draw
-    def _hold_fill(self, wp: _Warp, progress: float) -> np.ndarray:
-        """The warp's colour with the pads filled up to `progress`, drawn in perspective."""
-        color = wp.color.copy()
-        L = wp.layout
-        for px0, py0, px1, py1 in L.pads:
-            poly = clip_below(rounded_rect_points(px0, py0, px1, py1, L.pad_radius), py1 - progress * (py1 - py0))
-            if len(poly) < 3:
-                continue
-            q = cv2.perspectiveTransform(poly.reshape(-1, 1, 2).astype(np.float64), wp.tex_to_roi).reshape(-1, 2)
-            h, w = color.shape[:2]
-            x0, y0 = max(0, int(np.floor(q[:, 0].min()))), max(0, int(np.floor(q[:, 1].min())))
-            x1, y1 = min(w, int(np.ceil(q[:, 0].max())) + 1), min(h, int(np.ceil(q[:, 1].max())) + 1)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            m = np.zeros((y1 - y0, x1 - x0), np.uint8)
-            cv2.fillPoly(m, [np.int32(np.round((q - (x0, y0)) * 16))], 255, cv2.LINE_AA, shift=4)
-            a = m.astype(np.float32) * (0.45 / 255.0)
-            roi = color[y0:y1, x0:x1]
-            col = np.empty_like(roi)
-            col[:] = T.STATE["holding"]
-            roi[:] = cv2.blendLinear(col, roi, a, 1.0 - a)
-        return color
+    def _solid_like(self, color, shape) -> np.ndarray:
+        key = (tuple(int(v) for v in color), shape)
+        img = self._solid.get(key)
+        if img is None:
+            if len(self._solid) > 8:
+                self._solid.clear()
+            img = np.empty(shape, np.uint8)
+            img[:] = key[0]
+            self._solid[key] = img
+        return img
+
+    def _light_layers(self, lt: _Lights | None, now: float) -> list[tuple[np.ndarray, tuple]]:
+        """This frame's light effects as (alpha map, colour), in the ROI."""
+        out = []
+        if lt is None:
+            return out
+        if self._hold_vis > 0.001 and self._progress > 0.002:
+            # light runs round the outline from the near edge, both ways, meeting at the far side:
+            # the lit part plus a brighter moving head, as a table over "how far round"
+            d = np.float32(self._progress * 1.04) - _LEVELS
+            head = 0.35 * min(1.0, (1.0 - self._progress) * 8.0)
+            table = np.minimum(np.clip(d * 25.0, 0, 1) * 0.8 + np.clip(1.0 - np.abs(d) * 14.0, 0, 1) * head, 1.0)
+            light = cv2.LUT(lt.arc, table.astype(np.float32))
+            out.append((cv2.multiply(lt.edge, light, scale=T.HOLD_LIGHT * self._hold_vis), hold_color()))
+        if self._ready_vis > 0.001:
+            ph = (now - self._ready_t0) / T.PULSE_S
+            pulse = 0.5 - 0.5 * math.cos(2 * math.pi * ph) if self.animate else 0.5
+            level = (T.PULSE_LOW + (T.PULSE_HIGH - T.PULSE_LOW) * pulse) * self._ready_vis
+            out.append((lt.edge * np.float32(level), T.STATE["ready"]))
+        if self._ripple is not None:
+            u = (now - self._ripple[0]) / T.RIPPLE_S
+            if 0.0 <= u < 1.0:
+                radius = 1.2 * (1.0 - (1.0 - u) ** 2)               # fast at first, then easing out
+                env = min(1.0, u / 0.08) * (1.0 - u) ** 1.3          # fades in quickly, out slowly
+                d = _LEVELS * (255.0 / RADIAL_STEPS) - radius           # radial level -> distance to the ring
+                ring = np.minimum(np.clip(1.0 - d / T.RIPPLE_FRONT, 0, 1), np.clip(1.0 + d / T.RIPPLE_TAIL, 0, 1))
+                ring = cv2.LUT(lt.radial, (ring * ring).astype(np.float32))
+                out.append((cv2.multiply(lt.ripple, ring, scale=T.RIPPLE_ALPHA * env), self._ripple[1]))
+        return out
+
+    def _advance(self, state: str, progress: float, now: float, same_area: bool) -> None:
+        """Track state changes: start ripples, ease the light effects in and out."""
+        dt = 0.0 if self._last_now is None else min(0.2, max(0.0, now - self._last_now))
+        self._last_now = now
+        prev = self._state
+        if not same_area:
+            self._ripple = None
+        elif self.animate and prev is not None and state != prev:
+            if state == "solving":
+                self._ripple = (now, T.STATE["solving"])        # solve start
+            elif prev == "solving":
+                self._ripple = (now, T.TEXT)                    # solve stop
+        if self._ripple is not None and now - self._ripple[0] >= T.RIPPLE_S:
+            self._ripple = None
+        if state == "ready" and prev != "ready":
+            self._ready_t0 = now
+        self._state = state
+        step = dt / T.FADE_S if self.animate else 1.0
+        self._hold_vis = _approach(self._hold_vis, 1.0 if state == "holding" else 0.0, step)
+        self._ready_vis = _approach(self._ready_vis, 1.0 if state == "ready" else 0.0, step)
+        if state == "holding":
+            # the hold progress eases a little so it never jumps (it can drop back at once)
+            target = min(max(progress, 0.0), 1.0)
+            self._progress = target if (not self.animate or target < self._progress) else \
+                self._progress + (target - self._progress) * 0.6
+        elif self._hold_vis <= 0.0:
+            self._progress = 0.0
 
     def draw(self, img: np.ndarray, quad_px: np.ndarray, size_cm: tuple[float, float], state: str = "idle",
-             progress: float = 0.0, hands_px: Sequence[np.ndarray] = (), occlude: bool = True) -> None:
-        """Composite the mat into img (in place). hands_px: (21, 2) landmark arrays in image px."""
+             progress: float = 0.0, hands_px: Sequence[np.ndarray] = (), occlude: bool = True,
+             shape: Shape | None = None, now: float | None = None) -> None:
+        """Composite the area into img (in place).
+
+        quad_px: the image corners of the area's bounding box (far-left,
+        far-right, near-right, near-left); shape: a drawn outline (cm, see
+        Mat.shape), None for the rectangle; hands_px: (21, 2) landmark arrays in
+        image px; now: the time (perf_counter seconds) for the animations.
+        """
         import time
 
         t0 = time.perf_counter()
+        now = t0 if now is None else float(now)
+        if state not in STATES:
+            state = "idle"
         quad = np.asarray(quad_px, dtype=np.float64).reshape(4, 2)
         h, w = img.shape[:2]
         size = (float(size_cm[0]), float(size_cm[1]))
-        wp, shown_state = self.warp_for(quad, size, state, (w, h))
+        shape = _shape_key(shape)
+        wp, shown_state = self.warp_for(quad, size, state, (w, h), shape)
         if wp is None:
             return
-        qk = self._qkey(quad, size, (w, h))
-        # start a cross-fade when the state changes on the same mat position
-        if self._shown is not None and self._shown[0] == qk and self._shown[1] != shown_state and self.animate:
+        qk = self._qkey(quad, size, (w, h), shape)
+        same_area = self._shown is not None and self._shown[0] == qk
+        # start a cross-fade when the state changes on the same area
+        if same_area and self._shown[1] != shown_state and self.animate:
             prev = self._shown[2]
             if prev is not None and prev.alpha.shape == wp.alpha.shape and (prev.x0, prev.y0) == (wp.x0, wp.y0):
-                self._fade = (prev, t0)
-        elif self._shown is None or self._shown[0] != qk:
+                self._fade = (prev, now)
+        elif not same_area:
             self._fade = None
         self._shown = (qk, shown_state, wp)
-        # holding progress eases a little so it never jumps
-        target = min(max(progress, 0.0), 1.0) if state == "holding" else 0.0
-        self._progress = target if (not self.animate or target < self._progress) else \
-            self._progress + (target - self._progress) * 0.6
+        self._advance(state, progress, now, same_area)
 
         rh, rw = wp.alpha.shape
         roi = img[wp.y0:wp.y0 + rh, wp.x0:wp.x0 + rw]
@@ -725,27 +874,35 @@ class ArMatRenderer:
         if occlude and keep is None:
             self._learn_background(roi, (wp.x0, wp.y0, rw, rh))
 
-        def composite(warp: _Warp, color: np.ndarray) -> np.ndarray:
+        def composite(warp: _Warp, base: np.ndarray) -> np.ndarray:
             if keep is None:
-                return cv2.blendLinear(color, roi, warp.alpha, warp.inv_alpha)
-            a = cv2.multiply(warp.alpha, keep)          # cut the mat away under the hands
-            return cv2.blendLinear(color, roi, a, cv2.subtract(1.0, a))
+                return cv2.blendLinear(warp.color, base, warp.alpha, warp.inv_alpha)
+            a = cv2.multiply(warp.alpha, keep)          # cut the area away under the hands
+            return cv2.blendLinear(warp.color, base, a, cv2.subtract(1.0, a))
 
-        color = self._hold_fill(wp, self._progress) if (shown_state == "holding" and self._progress > 0.002) else wp.color
-        out = composite(wp, color)
+        out = composite(wp, roi)
         if self._fade is not None:
             prev, start = self._fade
-            f = (t0 - start) / T.FADE_S
-            if f >= 1.0:
+            f = (now - start) / T.FADE_S
+            if f >= 1.0 or f < 0.0:
                 self._fade = None
             else:
                 f = f * f * (3 - 2 * f)                   # smoothstep
-                out = cv2.addWeighted(out, f, composite(prev, prev.color), 1.0 - f, 0)
+                out = cv2.addWeighted(out, f, composite(prev, roi), 1.0 - f, 0)
+        wants_lights = (self._hold_vis > 0.001 and self._progress > 0.002) or self._ready_vis > 0.001 \
+            or self._ripple is not None
+        if wants_lights:
+            lt = self.lights_for(quad, size, (w, h), shape)
+            if lt is not None and (lt.x0, lt.y0) == (wp.x0, wp.y0) and lt.edge.shape == wp.alpha.shape:
+                for a, color in self._light_layers(lt, now):
+                    if keep is not None:
+                        a = cv2.multiply(a, keep)
+                    out = cv2.blendLinear(self._solid_like(color, out.shape), out, a, cv2.subtract(1.0, a))
         roi[:] = out
         self.last_ms = (time.perf_counter() - t0) * 1000
 
     def _learn_background(self, roi: np.ndarray, box: tuple) -> None:
-        """Slowly track what the table under the mat looks like while no hand is over it."""
+        """Slowly track what the table under the area looks like while no hand is over it."""
         if self._bg_box != box or self._bg is None:
             self._bg, self._bg_box = roi.copy(), box
         else:

@@ -258,6 +258,7 @@ class App:
             self.say("Zone setup cancelled - zone unchanged")
         elif code in (10, 13):
             plane_used = setup.plane
+            drawn = setup.mode is SetupMode.DRAW
             result = setup.accept()
             if result is None:
                 self.say("Not all 4 markers seen yet" if setup.mode is SetupMode.MARKERS else "No zone yet")
@@ -274,7 +275,8 @@ class App:
             self.set_zone(zone)
             saved = self._save(zone=(mode, zone.to_config()), **blocks)
             warn = zone_warnings(zone)
-            what = {"markers": "follows the markers", "mat": "AR mat"}.get(mode, mode)
+            what = {"markers": "follows the markers", "mat": "drawn area on the table" if drawn else "AR mat"}.get(
+                mode, "drawn shape" if drawn else mode)
             self.say(f"Zone set ({what}), {saved}" + (f". Warning: {'; '.join(warn)}" if warn else ""),
                      5.0 if warn else 3.0)
         elif ch in ("[", "]"):
@@ -431,20 +433,21 @@ class App:
         hands = self._hands_in_px(sample)
         if not self.ar_enabled or zone_mode == "off" or self.calib.active:
             return None
-        quad = size = None
+        quad = size = shape = None
         state = zone_mode if zone_mode in ("idle", "holding", "ready", "solving") else "idle"
         if self.setup is not None and self.setup.active:
             m, plane = self.setup.candidate_mat, self.setup.plane
             if m is not None and plane is not None:
-                quad, size = m.image_quad(plane), (m.width_cm, m.height_cm)
+                quad, size, shape = m.image_quad(plane), (m.width_cm, m.height_cm), m.shape
         elif self.zone_mode == "mat" and self.plane is not None and self.mat is not None:
-            quad, size = self.mat.image_quad(self.plane), (self.mat.width_cm, self.mat.height_cm)
+            m = self.mat
+            quad, size, shape = m.image_quad(self.plane), (m.width_cm, m.height_cm), m.shape
         elif self.zone_mode == "markers" and self.markers is not None and len(self.zone.points) == 4:
             quad = np.array(self.zone.points) * self._canvas
             size = self._marker_mat_size(quad)
         if quad is None:
             return None
-        return ArView(quad, size, state, progress if state == "holding" else 0.0, hands)
+        return ArView(quad, size, state, progress if state == "holding" else 0.0, hands, shape)
 
     # ---------------------------------------------------------------- helpers
     def say(self, msg: str, seconds: float = 3.0) -> None:
@@ -615,7 +618,8 @@ class App:
             )
         else:
             status.append(f"Keyboard mode | loop {eff:.0f} Hz | timing resolution {res}")
-        zone_txt = {"markers": "markers", "mat": "AR mat" if self.ar_enabled else "mat (AR off)"}.get(
+        drawn = " (drawn)" if self.mat is not None and self.mat.shape else ""
+        zone_txt = {"markers": "markers", "mat": f"AR mat{drawn}" if self.ar_enabled else f"mat{drawn} (AR off)"}.get(
             self.zone_mode, "rectangle" if self.zone.is_rect else "polygon")
         if self.markers is not None and self.zone_mode == "markers":
             zone_txt += f" ({self.markers.snapshot()[1]})"
