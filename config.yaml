@@ -38,23 +38,6 @@ timer:
 storage:
   path: solves.json
 
-# Stage 2: cube face reading. Only runs while the timer is IDLE and nothing is in the start zone.
-vision:
-  enabled: true
-  process_width: 640   # frames are downscaled to this width for face detection
-  still_time: 0.3      # seconds the cube must be held still before colours are read
-  auto_verify: true    # check the scramble automatically whenever a face is shown (toggle with V)
-  calibration_path: calibration.json   # written by the C (calibrate) flow
-
-# R toggles recording of solves (frames + timestamps + scramble + result) for training data.
-dataset:
-  path: datasets       # git-ignored
-  jpeg_quality: 90
-  max_queue: 120       # frames waiting to be written; beyond this frames are dropped, never the timer
-  preroll: 0.5         # seconds of video kept from before inspection/solve start
-  tail: 0.5            # seconds kept after the stop
-  max_width: 0         # 0 = full camera resolution; e.g. 960 to save disk space
-
 ui:
   window_name: CubeCam
   keyboard_canvas: [1280, 720]   # window size when there is no camera

@@ -22,3 +22,15 @@ def test_corrupt_file_is_backed_up(tmp_path):
     assert store.warning
     assert not p.exists()
     assert len(list(tmp_path.glob("solves.corrupt-*.json"))) == 1
+
+
+def test_extra_fields_from_later_stages_are_ignored(tmp_path):
+    import json
+    path = tmp_path / "solves.json"
+    path.write_text(json.dumps({"version": 1, "solves": [
+        {"time": 12.3, "penalty": "+2", "scramble": "R U", "motion": {"turns": 40}, "future": [1, 2]},
+    ]}), encoding="utf-8")
+    store = SolveStore(path)
+    solves = store.load()
+    assert store.warning is None
+    assert len(solves) == 1 and solves[0].time == 12.3 and solves[0].penalty is Penalty.PLUS2

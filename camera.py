@@ -62,9 +62,6 @@ class Camera:
         self._cond = threading.Condition()
         self._frame: Frame | None = None
         self._times: deque[float] = deque(maxlen=90)
-        # Called from the capture thread with every Frame (after it is published). Listeners must
-        # return immediately (e.g. put_nowait into a queue) so they can never delay a timestamp.
-        self.listeners: list = []
 
     # ------------------------------------------------------------------ open
     def _candidate_backends(self) -> list[tuple[str, int]]:
@@ -134,16 +131,10 @@ class Camera:
             if not ok or img is None:
                 continue
             seq += 1
-            frame = Frame(img, t, seq)
             with self._cond:
-                self._frame = frame
+                self._frame = Frame(img, t, seq)
                 self._times.append(t)
                 self._cond.notify_all()
-            for listener in self.listeners:  # e.g. dataset recorder; must be non-blocking
-                try:
-                    listener(frame)
-                except Exception:
-                    pass
 
     # ------------------------------------------------------------------ access
     @property

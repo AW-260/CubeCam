@@ -1,4 +1,4 @@
-"""CubeCam - webcam-triggered Rubik's cube timer (stage 2: + cube vision).
+"""CubeCam - webcam-triggered Rubik's cube timer (stage 1).
 
 Run:  python main.py [--config config.yaml] [--no-camera]
 """
@@ -26,7 +26,6 @@ from stats import compute_stats
 from storage import SolveStore
 from timer_state import EventType, State, TimerConfig, TimerStateMachine
 from ui import GREEN, ORANGE, RED, WHITE, YELLOW, Renderer, ViewModel
-from vision.controller import VisionController
 
 BASE = Path(__file__).resolve().parent
 
@@ -102,11 +101,6 @@ class App:
 
         startup_msgs = [m for m in (cfg_warning, self.store.warning) if m]
         startup_msgs += self._setup_camera(force_no_camera)
-        self.vision = VisionController(c, _resolve, self.say, have_camera=self.camera is not None)
-        if self.camera is not None and self.vision.recorder is not None:
-            self.camera.listeners.append(self.vision.recorder.on_frame)
-        self._rec_open = False
-        startup_msgs += self.vision.startup_messages
         if self.solves:
             startup_msgs.append(f"Loaded {len(self.solves)} solves from {self.store.path.name}")
         if startup_msgs:
@@ -150,25 +144,8 @@ class App:
         return self.loop_rate.rate
 
     # ------------------------------------------------------------------ events
-    def _begin_recording(self, t: float) -> None:
-        if self._rec_open:
-            return
-        self._rec_open = True
-        cam = self.camera
-        self.vision.on_solve_begin(t, {
-            "scramble": self.scramble,
-            "inspection": self.machine.config.inspection_enabled,
-            "camera": None if cam is None else {"width": cam.width, "height": cam.height,
-                                                "measured_fps": round(cam.measured_fps, 1),
-                                                "backend": cam.backend_name},
-            "display_mirrored": self.mirror,
-            "started": datetime.now().isoformat(timespec="seconds"),
-        })
-
     def handle_events(self, events) -> None:
         for e in events:
-            if e.type in (EventType.INSPECTION_START, EventType.SOLVE_START):
-                self._begin_recording(e.t)
             if e.type == EventType.INSPECTION_WARNING:
                 sec = int(e.data)
                 self._flash_color = ORANGE if sec < 12 else RED
@@ -189,18 +166,11 @@ class App:
                 )
                 self.solves.append(solve)
                 self.save()
-                self.vision.on_solve_end(e.t, {
-                    "time": solve.time, "penalty": solve.penalty.value, "inspection_time": solve.inspection,
-                    "solve_start": r.start, "solve_end": r.end, "processed_fps": solve.fps,
-                })
-                self._rec_open = False
                 self.scramble = generate_scramble()
                 if r.penalty != Penalty.OK:
                     self.say(f"Inspection {r.inspection_time:.2f}s -> {r.penalty.value}", 4.0)
             elif e.type == EventType.ABORT:
                 self.say("Aborted - solve not recorded", 2.0)
-                self.vision.on_abort(e.t)
-                self._rec_open = False
 
     def save(self) -> None:
         try:
@@ -218,8 +188,6 @@ class App:
         busy = self.machine.state in (State.SOLVING, State.INSPECTION, State.READY)
         if ch == "q":
             return False
-        if self.vision.on_key(key, ch, idle=self.machine.state == State.IDLE):
-            return True
         if key & 0xFF == 27:
             self.handle_events(self.machine.abort(t))
         elif ch in ("2", "d") or key & 0xFF in (8, 127):
@@ -284,7 +252,7 @@ class App:
                 sub = "lift to start inspection" if m.config.inspection_enabled else "READY - lift to start"
             elif m.hold_progress(t) > 0:
                 color = YELLOW
-        if not self.hand_mode or self.vision.modal:
+        if not self.hand_mode:
             zone_mode = "off"
         elif st == State.READY:
             zone_mode = "ready"
@@ -308,13 +276,9 @@ class App:
             status.append(f"Keyboard mode | loop {eff:.0f} Hz | timing resolution {res}")
         status.append(
             f"State {st.value} | inspection {'ON' if m.config.inspection_enabled else 'OFF'} | "
-            f"trigger: {'hands' if self.hand_mode and not self.vision.modal else ''}"
-            f"{' + ' if self.hand_mode and not self.vision.modal else ''}SPACE"
+            f"trigger: {'hands' if self.hand_mode else ''}{' + ' if self.hand_mode else ''}SPACE"
             f"{'' if self.space.polled else ' (tap toggles)'}"
         )
-        vline = self.vision.status_line()
-        if vline:
-            status.append(vline)
 
         debug = {
             "state": st.value,
@@ -328,9 +292,6 @@ class App:
             debug["palms in zone"] = sum(sample.debug["palms_in_zone"])
             debug["detect ms"] = f"{sample.debug['detect_ms']:.1f}"
             debug.update({k: sample.debug[k] for k in ("hands", "palms", "palms_in_zone")})
-        if self.show_debug:
-            for key_, val in self.vision.debug_info().items():
-                debug[key_] = val
 
         stats = compute_stats(self.solves)
         return ViewModel(
@@ -349,7 +310,6 @@ class App:
             flash=self._flash_color if now < self._flash_until else None,
             show_debug=self.show_debug,
             debug=debug,
-            vision=self.vision.view(self.show_debug),
         )
 
     # ------------------------------------------------------------------- loop
@@ -365,7 +325,6 @@ class App:
         shown = False
         try:
             while True:
-                frame = None
                 if self.camera is not None and self.camera.alive:
                     frame = self.camera.wait_new(last_seq, timeout=0.05)
                     if frame is None:
@@ -391,14 +350,7 @@ class App:
 
                 self.loop_rate.tick(t)
                 space_down = self.space.is_down()
-                # While calibrating/scanning, hands holding the cube up must not arm the timer.
-                hands = sample.active and not self.vision.modal
-                self.handle_events(self.machine.update(t, hands or space_down))
-                if self.camera is not None and frame is not None:
-                    m = self.machine
-                    allowed = m.state == State.IDLE and not m.zone_active and not m.raw_active
-                    self.vision.set_scramble(self.scramble)
-                    self.vision.feed(img, t, frame.seq, self.mirror, allowed, self.show_debug)
+                self.handle_events(self.machine.update(t, sample.active or space_down))
                 vm = self.build_view(t, sample, space_down, img.shape[1])
                 cv2.imshow(self.window, self.renderer.render(img, vm))
                 shown = True
@@ -412,7 +364,6 @@ class App:
     def close(self) -> None:
         if self.camera is not None:
             self.camera.close()
-        self.vision.close()
         self.detector.close()
         cv2.destroyAllWindows()
 
