@@ -22,6 +22,7 @@ class Solve:
     timestamp: str = ""          # ISO-8601 local time the solve finished
     fps: float | None = None     # effective sampling rate used to time this solve
     inspection: float | None = None  # inspection time used, if inspection was on
+    motion: dict | None = None   # stage 3 result (vision.motion_analysis.MotionResult.to_dict), if measured
 
     @property
     def effective(self) -> float:
@@ -46,6 +47,7 @@ class Solve:
             timestamp=str(d.get("timestamp", "")),
             fps=None if d.get("fps") is None else float(d["fps"]),
             inspection=None if d.get("inspection") is None else float(d["inspection"]),
+            motion=d["motion"] if isinstance(d.get("motion"), dict) else None,
         )
 
 

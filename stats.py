@@ -67,6 +67,30 @@ class SessionStats:
     mean: float | None
 
 
+@dataclass(frozen=True)
+class MotionAverages:
+    """Means over the last n solves that have stage-3 motion data (None if fewer than n have it)."""
+
+    n: int
+    tps: float | None
+    tps_turning: float | None
+    turns: float | None
+    paused: float | None
+
+
+def motion_averages(solves: Sequence[Solve], n: int) -> MotionAverages:
+    with_data = [s.motion for s in solves if s.motion and s.motion.get("turns") is not None]
+    if len(with_data) < n:
+        return MotionAverages(n, None, None, None, None)
+    last = with_data[-n:]
+
+    def mean(key):
+        vals = [m.get(key) for m in last if m.get(key) is not None]
+        return sum(vals) / len(vals) if vals else None
+
+    return MotionAverages(n, mean("tps"), mean("tps_turning"), mean("turns"), mean("paused_time"))
+
+
 def compute_stats(solves: Sequence[Solve]) -> SessionStats:
     return SessionStats(
         count=len(solves),

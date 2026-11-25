@@ -27,7 +27,12 @@ RED = (60, 60, 240)
 CYAN = (230, 200, 60)
 
 HELP = ("SPACE timer  2 +2  D DNF  BKSP delete  I inspection  N scramble  C calibrate  S scan  V check  "
-        "R record  H debug  ESC abort  Q quit")
+        "R record  P practice  T motion panel  H debug  ESC abort  Q quit")
+TL_TURN = (90, 200, 90)        # timeline colours (BGR)
+TL_PAUSE = (70, 70, 70)
+TL_ROT = (230, 200, 60)
+TL_UNSURE = (200, 200, 200)
+TL_LONG = (0, 150, 255)
 
 # Sticker colours for drawing (BGR)
 STICKER = {"W": (240, 240, 240), "Y": (0, 215, 255), "R": (40, 40, 215), "O": (0, 140, 255),
@@ -61,6 +66,22 @@ class VisionView:
 
 
 @dataclass
+class MotionView:
+    """Stage 3: move count / TPS / pause results, session averages, practice mode."""
+
+    show: bool = True
+    averages: list = field(default_factory=list)          # (n, tps, turns, paused_s) for the last 5 / 12
+    practice_tokens: list[str] | None = None              # practice sequence (replaces the scramble)
+    practice_index: int = -2                              # cued step (-2 idle, -1 lead-in, len = done)
+    countdown: str = ""
+    title: str = ""                                       # practice panel
+    lines: list[str] = field(default_factory=list)
+    result_title: str = ""                                # last solve / run
+    result_lines: list[str] = field(default_factory=list)
+    timeline: dict | None = None                          # MotionResult.to_dict()
+
+
+@dataclass
 class ViewModel:
     state: State
     time_text: str
@@ -78,6 +99,7 @@ class ViewModel:
     show_debug: bool = False
     debug: dict[str, Any] = field(default_factory=dict)
     vision: VisionView | None = None
+    motion: MotionView | None = None
 
 
 def _text(img, s, org, scale, color=WHITE, thick=1, font=FONT, shadow=True):
@@ -119,9 +141,14 @@ class Renderer:
         self._panel_bottom = 0
         if vm.vision is not None:
             self._vision_overlay(img, vm.vision, k)
-        self._scramble(img, vm, k)
+        if vm.motion is not None and vm.motion.practice_tokens:
+            self._practice_sequence(img, vm.motion, k)
+        else:
+            self._scramble(img, vm, k)
         if vm.vision is not None:
             self._vision_panels(img, vm, k)
+        if vm.motion is not None and vm.motion.show and not (vm.vision and (vm.vision.panel_title or vm.vision.net)):
+            self._motion_panel(img, vm.motion, k)
         if vm.show_debug:
             self._debug(img, vm, k)
         self._timer(img, vm, k)
@@ -189,24 +216,42 @@ class Renderer:
         scale, thick, lh = 0.6 * k, 1, int(26 * k)
         x0, y0 = int(12 * k), int(130 * k)
         n_recent = min(len(vm.recent), 5)
-        height = lh * (len(rows) + n_recent) + (int(8 * k) if n_recent else 0) + int(16 * k)
+        mot = vm.motion.averages if vm.motion is not None and vm.motion.averages else []
+        mrows = 4 if mot else 0
+        height = lh * (len(rows) + n_recent + mrows) + (int(8 * k) if n_recent else 0) + int(16 * k)
         _panel(img, 0, y0 - int(24 * k), int(215 * k), y0 + height - int(16 * k), alpha=0.55)
         for i, (name, val) in enumerate(rows):
             y = y0 + i * lh
             _text(img, name, (x0, y), scale, GREY, thick, shadow=False)
             _text(img, val, (x0 + int(90 * k), y), scale, WHITE, thick, shadow=False)
-        y = y0 + len(rows) * lh + int(8 * k)
+        y = y0 + len(rows) * lh
+        if mot:   # stage 3 session averages over the last 5 / 12 solves with motion data
+            cols = [x0 + int(78 * k), x0 + int(145 * k)]
+            _text(img, "last", (x0, y), 0.5 * k, GREY, thick, shadow=False)
+            for c, (n, *_rest) in zip(cols, mot):
+                _text(img, str(n), (c, y), 0.5 * k, GREY, thick, shadow=False)
+            fmt = [("TPS", lambda a: "-" if a[1] is None else f"{a[1]:.2f}"),
+                   ("moves", lambda a: "-" if a[2] is None else f"{a[2]:.0f}"),
+                   ("pause", lambda a: "-" if a[3] is None else f"{a[3]:.1f}s")]
+            for r, (name, f) in enumerate(fmt, start=1):
+                _text(img, name, (x0, y + r * lh), scale, GREY, thick, shadow=False)
+                for c, a in zip(cols, mot):
+                    _text(img, f(a), (c, y + r * lh), scale, WHITE, thick, shadow=False)
+            y += mrows * lh
+        y += int(8 * k)
         for j, s in enumerate(vm.recent[-5:][::-1]):
             _text(img, f"{vm.stats.count - j}. {s}", (x0, y + j * lh), 0.55 * k, CYAN, thick, shadow=False)
 
     def _status(self, img, vm: ViewModel, k: float) -> None:
         h, w = img.shape[:2]
         scale, lh = 0.5 * k, int(22 * k)
-        lines = vm.status_lines + [HELP]
+        lines = []
+        for line in vm.status_lines + [HELP]:
+            lines += [(part, line is HELP) for part in _wrap(line, w - int(20 * k), scale, 1)]
         _panel(img, 0, h - lh * len(lines) - int(10 * k), w, h, alpha=0.6)
-        for i, line in enumerate(lines):
+        for i, (line, is_help) in enumerate(lines):
             _text(img, line, (int(10 * k), h - int(10 * k) - (len(lines) - 1 - i) * lh), scale,
-                  GREY if line is HELP else WHITE, 1, shadow=False)
+                  GREY if is_help else WHITE, 1, shadow=False)
 
     def _message(self, img, msg: str, k: float) -> None:
         h, w = img.shape[:2]
@@ -307,6 +352,118 @@ class Renderer:
             y += int(22 * k)
         if v.net is not None:
             self._net(img, v, x0 + (pw - cell * 12) // 2, y - int(8 * k), cell)
+
+    # ------------------------------------------------------------------ stage 3: motion
+    def _practice_sequence(self, img, m: MotionView, k: float) -> None:
+        """The practice sequence in place of the scramble; the cued move is boxed in yellow."""
+        h, w = img.shape[:2]
+        scale, thick = 0.85 * k, max(1, int(2 * k))
+        gap = int(14 * k)
+        line_h = int(36 * k)
+        sizes = [cv2.getTextSize(tok, FONT, scale, thick)[0][0] for tok in m.practice_tokens]
+        lines, cur, cur_w = [], [], 0
+        for i, sw in enumerate(sizes):
+            if cur and cur_w + gap + sw > w - int(40 * k):
+                lines.append(cur)
+                cur, cur_w = [], 0
+            cur.append(i)
+            cur_w += sw + (gap if cur_w else 0)
+        if cur:
+            lines.append(cur)
+        extra = 1 if m.countdown or m.practice_index >= len(m.practice_tokens) else 0
+        _panel(img, 0, 0, w, int(14 * k) + line_h * (len(lines) + extra), alpha=0.65)
+        for li, idxs in enumerate(lines):
+            total = sum(sizes[i] for i in idxs) + gap * (len(idxs) - 1)
+            x = (w - total) // 2
+            y = int(36 * k) + li * line_h
+            for i in idxs:
+                tok = m.practice_tokens[i]
+                done = m.practice_index > i
+                now = m.practice_index == i
+                col = YELLOW if now else (GREY if done else WHITE)
+                if tok.startswith("P"):
+                    col = ORANGE if now else (GREY if done else CYAN)
+                if now:
+                    cv2.rectangle(img, (x - int(5 * k), y - int(28 * k)), (x + sizes[i] + int(5 * k), y + int(9 * k)),
+                                  YELLOW, max(1, int(2 * k)))
+                _text(img, tok, (x, y), scale, col, thick)
+                x += sizes[i] + gap
+        y = int(36 * k) + len(lines) * line_h
+        if m.countdown:
+            msg = f"get ready... first move in {m.countdown} s"
+            tw = cv2.getTextSize(msg, FONT, 0.7 * k, thick)[0][0]
+            _text(img, msg, ((w - tw) // 2, y), 0.7 * k, YELLOW, thick)
+        elif m.practice_index >= len(m.practice_tokens):
+            msg = "done - put your hands back to stop"
+            tw = cv2.getTextSize(msg, FONT, 0.7 * k, thick)[0][0]
+            _text(img, msg, ((w - tw) // 2, y), 0.7 * k, GREEN, thick)
+
+    def _motion_panel(self, img, m: MotionView, k: float) -> None:
+        h, w = img.shape[:2]
+        blocks = []
+        if m.title:
+            blocks.append((m.title, m.lines))
+        if m.result_title:
+            blocks.append((m.result_title, m.result_lines))
+        if not blocks:
+            return
+        pw = int(430 * k)
+        x0 = w - pw - int(10 * k)
+        y0 = max(int(120 * k), getattr(self, "_panel_bottom", 0) + int(10 * k))
+        wrapped = []
+        for title, lines in blocks:
+            body = []
+            for line in lines:
+                body.extend(_wrap(line, pw - int(20 * k), 0.5 * k, 1))
+            wrapped.append((title, body))
+        lh = int(21 * k)
+        tl_h = int(52 * k) if m.timeline is not None else 0
+        ph = sum(int(30 * k) + len(b) * lh for _, b in wrapped) + tl_h + int(10 * k)
+        _panel(img, x0, y0, x0 + pw, y0 + ph, 0.75)
+        y = y0
+        for title, body in wrapped:
+            y += int(26 * k)
+            _text(img, title, (x0 + int(10 * k), y), 0.65 * k, CYAN, max(1, int(2 * k)), shadow=False)
+            y += int(4 * k)
+            for line in body:
+                y += lh
+                _text(img, line, (x0 + int(10 * k), y), 0.5 * k, WHITE, 1, shadow=False)
+        if m.timeline is not None:
+            self._timeline(img, m.timeline, x0 + int(12 * k), y + int(14 * k), pw - int(24 * k), int(16 * k), k)
+        self._panel_bottom = y0 + ph
+
+    def _timeline(self, img, r: dict, x0: int, y0: int, width: int, bar_h: int, k: float) -> None:
+        """Turning (green) vs paused (grey) over the solve, rotations cyan, unclassified white,
+        the three longest pauses outlined in orange and numbered, time axis below."""
+        dur = float(r.get("duration") or 0)
+        if dur <= 0:
+            return
+        sx = width / dur
+
+        def X(t):
+            return x0 + int(round(min(max(t, 0.0), dur) * sx))
+
+        cv2.rectangle(img, (x0, y0), (x0 + width, y0 + bar_h), TL_PAUSE, -1)
+        for a, b in r.get("turning", []):
+            cv2.rectangle(img, (X(a), y0), (max(X(a) + 1, X(b)), y0 + bar_h), TL_TURN, -1)
+        for a, b, kind in r.get("events", []):
+            if kind.startswith("R"):
+                col = TL_ROT
+            elif kind.startswith("U"):
+                col = TL_UNSURE
+            else:
+                continue
+            cv2.rectangle(img, (X(a), y0 + bar_h // 4), (max(X(a) + 1, X(b)), y0 + bar_h - bar_h // 4), col, -1)
+        for i, (a, d) in enumerate(r.get("longest_pauses", [])[:3]):
+            cv2.rectangle(img, (X(a), y0 - 2), (X(a + d), y0 + bar_h + 2), TL_LONG, max(1, int(2 * k)))
+            _text(img, str(i + 1), (X(a + d / 2) - int(4 * k), y0 - int(4 * k)), 0.4 * k, TL_LONG, 1, shadow=False)
+        step = 5 if dur <= 40 else 10 if dur <= 120 else 30
+        t = 0
+        while t <= dur + 1e-6:
+            x = X(t)
+            cv2.line(img, (x, y0 + bar_h), (x, y0 + bar_h + int(5 * k)), GREY, 1)
+            _text(img, f"{t:g}", (x - int(6 * k), y0 + bar_h + int(18 * k)), 0.38 * k, GREY, 1, shadow=False)
+            t += step
 
     def _net(self, img, v: VisionView, x0: int, y0: int, cell: int) -> None:
         for fi, f in enumerate("URFDLB"):

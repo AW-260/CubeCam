@@ -52,6 +52,24 @@ DEFAULTS: dict = {
         "tail": 0.5,
         "max_width": 0,
     },
+    "motion": {                 # stage 3: move count / TPS / pauses (see README)
+        "enabled": True,
+        "crop": 128,
+        "roi_scale": 1.0,
+        "roi_dy": 0.0,
+        "default_roi": [0.5, 0.45, 0.40],
+        "flow_preset": 1,
+        "save_features": "practice",   # practice | all | none  (compressed numbers only, never images)
+        "features_path": "motion_data",
+        "analysis": {},                # overrides for vision.motion_analysis.AnalysisParams
+    },
+    "practice": {
+        "path": "practice_data",
+        "tempo": 1.0,                  # cued moves per second; 0 = free pace (no cues)
+        "lead_in": 2.0,                # seconds after the start before the first cue
+        "metronome": False,            # beep on every cue
+        "sequences": None,             # list of sequences; None = built-in list (vision/practice.py)
+    },
     "ui": {"window_name": "CubeCam", "keyboard_canvas": [1280, 720], "show_debug": False},
 }
 

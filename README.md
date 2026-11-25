@@ -6,7 +6,11 @@ to stop.
 
 Stage 2 adds cube vision while the timer is idle. It reads sticker colours when
 you hold a face still, checks your scramble, scans the whole cube and records
-solves as training data. Move counting comes in a later stage.
+solves as training data.
+
+Stage 3 measures each solve: move count, whole-cube rotations, TPS and a timeline of
+turning vs pauses, from the motion of the cube between your hands (no smart cube, no
+video saved). A practice mode with known sequences checks how accurate that is for you.
 
 ## Setup
 
@@ -62,6 +66,15 @@ Stage 2 (cube vision, only while the timer is IDLE):
 | `V` | Turn the scramble check on or off (on by default via `vision.auto_verify`). |
 | `R` | Turn dataset recording of solves on or off. |
 | `H` | The debug overlay also shows the detected grid, each sticker's colour and confidence, and the vision timings. |
+
+Stage 3 (move count / TPS):
+
+| Key | What it does |
+|---|---|
+| `P` | Practice mode on/off (idle only). The scramble line shows a known sequence instead. |
+| `N` | In practice mode: next practice sequence. |
+| `+` / `-` | In practice mode: cue tempo (moves per second; 0 = free pace, no cues). |
+| `T` | Show/hide the motion panel (last solve's numbers and timeline). |
 
 While calibrating or scanning, the hand trigger is ignored. Holding the cube up to
 the camera can't arm the timer, and the start zone is hidden. If you start the
@@ -199,6 +212,118 @@ as +2, DNF or deleting it with Backspace, are not written back to `meta.json`.
    `datasets/` should contain a folder per solve.
 6. If you have one, try a stickerless cube and a solved stickerless face.
 
+## Move count, TPS and pauses (stage 3)
+
+After every solve the panel on the right shows:
+
+* **Moves**: layer turns. A half turn (R2) counts as **one** turn; slices (M) and wide
+  moves (r) are one turn each. **Rotations** (x, y, z) are counted separately.
+  Anything the app can't tell apart is counted as **unclassified**, never guessed.
+* **TPS** two ways: turns / solve time, and turns / time spent turning.
+* **Paused**: total time in pauses, the number of pauses (stops of at least 0.5 s),
+  and the 3 longest with when they happened.
+* A **timeline**: green = turning (including rotations and the short gaps between
+  moves), grey = paused, cyan marks = rotations, white = unclassified, orange
+  boxes = the 3 longest pauses, time axis in seconds.
+
+The stats panel adds TPS, moves and paused time averaged over your last 5 and 12
+solves that have motion data. Results are stored with each solve in `solves.json`
+under `"motion"` (about 1-2 KB). Older solves without it load as before.
+
+### Definitions
+* **Turning vs paused.** A pause is any stop of at least 0.5 s with no turning
+  and no rotating. Everything else is turning time, including the short gaps
+  between moves of one algorithm. Paused + turning = the solve time.
+* **Half turns.** A half turn is recognised when one event shows two
+  same-direction humps (the same part keeps moving the same way, for example U2
+  done as a double flick), is clearly longer or farther than this solve's typical
+  turn, or lasts at least 0.36 s. Either way it is **one** turn, and the count of
+  half turns is shown separately. Quarter-vs-half is the least reliable label (see
+  the accuracy below); the move count does not depend on it.
+
+### How it works
+* **Cube region.** The hand tracker already runs on every frame. The cube is held
+  between the hands, so the region is a square between the two palm centres,
+  smoothed over time and held for a moment when a hand is lost. Arms, the body and
+  anything outside that square are never looked at.
+* **Per frame** (in a background thread, `vision/motion.py`): the same square is cut
+  from the previous and the current frame at 128x128 px and the hands are masked
+  out: the palm and finger bones are drawn from the landmarks, plus skin-coloured
+  pixels right next to them. Colour alone isn't used, because red and orange stickers
+  look like skin in warm light. Then dense optical flow (DIS) is computed, and a
+  row of about 90 numbers is kept: how the cube body moves, how the hands move,
+  how much of the cube moves relative to the rest, and a 5x5 grid of mean flow.
+  The frame itself is dropped straight away; only the previous one is kept, to
+  compare against.
+* **After the stop** (`vision/motion_analysis.py`, pure numpy):
+  * **Layer motion.** Part of the cube moves while the rest stays still, and the
+    movement isn't just the hands carrying it. Bursts of activity are split into
+    single moves at the dips between them. Back-to-back humps where the same region
+    keeps moving the same way are merged into one move (a half turn).
+  * **Rotations.** The middle of the region (the middle of the face you see) stays
+    still for R/L/U/D/F turns, but moves with the cube in x/y rotations. An event
+    is a rotation when the middle carries most of its motion, a turn when it
+    carries little, and unclassified in between.
+  * **Carrying.** Lifting or putting the cube down (the cube and the hands moving
+    together) is not a move.
+* **The timer is never slowed down.** `main.py` hands the worker a reference to the
+  raw frame plus the landmarks it already has. That costs about 0.01 ms. If the
+  worker is still busy, the waiting frame is replaced and counted as dropped. The
+  worker needs about 2-3 ms per frame. `python tools/profile_motion.py` measures
+  the processed hand-tracking FPS with stage 3 off, on, and off again.
+
+### Practice mode (`P`): checking accuracy without a smart cube
+The scramble line shows a known sequence. Rest your hands, lift, then perform it.
+With a tempo set, the move to do now is boxed in yellow, one move per beat, after a
+2 s lead-in. `P2` means hold still for 2 s. Put your hands back to stop. The run is
+saved to `practice_data/practice.json` with its labels: the sequence, the true
+turn/rotation/half-turn counts, the cue times, and what was measured. The per-frame
+numbers (about 2 KB per second, no images) go to `practice_data/features/`. Practice
+runs are **not** added to your solves. The same sequence stays loaded so you can
+repeat it; `N` moves on. A "random" item draws a new 15-turn sequence with 3
+rotations each time.
+
+```powershell
+python tools/evaluate_counts.py                # accuracy on your practice runs
+python tools/evaluate_counts.py --set on=0.15 rot_hi=0.65   # re-analyse them with other thresholds
+python tools/evaluate_counts.py --synthetic 18 # the same report on rendered clips
+python tools/profile_motion.py                 # processed FPS with / without stage 3 (live camera)
+```
+
+The report gives measured vs true turns, rotations, unclassified and half turns per
+run. For paced runs it also checks whether each deliberate pause was found, and how
+well turning/paused periods match the cues after estimating your reaction lag.
+
+### Accuracy so far (synthetic only, not yet on a real cube)
+On rendered 30 fps clips (`tools/evaluate_counts.py --synthetic 18`) of a cube seen
+from the back with hands on its sides, motion blur, the cube being lifted, and
+landmark noise:
+
+| Sequence type | Turns | Rotations |
+|---|---|---|
+| R / U / L sequences | 18-24 of 20-24 (within 1-2) | no false rotations |
+| x / y only | - | 8/8, 8/8 |
+| y R U R' y' | 9/9 | 4-6 of 6 (rest unclassified) |
+| R2 U2 | 8-9 of 8 (each R2 counted once) | - |
+| Deliberate pauses | all 14 found | - |
+| F R U R' U' F' | 11-12 of 18 | - |
+| r U R' U' (wide) | 11 of 16 | 3-4 false rotations |
+
+Overall turn error is 12% (mostly F and wide moves). Half-turn labels vary a lot
+between clips (7/8 in one, 2/8 in another).
+
+### Known limitations
+* **F (and B) turns from behind.** The camera sees the face pointing away from you.
+  An F turn mostly moves the side of the cube nearest to you, so the camera sees
+  little of it and F turns are undercounted. A camera a little higher, looking down
+  on the top face, helps.
+* **Wide moves** (r, u) move the middle of the visible face, so they can look like
+  rotations. **z rotations and B turns** both spin the visible face in place and
+  can't be told apart. These usually come out as turns or unclassified.
+* It needs both hands tracked. The panel says "Motion data low: hands tracked in
+  N% of frames" when that wasn't the case.
+* Thresholds come from synthetic data. Phase B tunes them on recorded practice runs.
+
 ## Configuration (`config.yaml`)
 
 The main settings are the zone position and size (fractions of the frame), camera
@@ -257,9 +382,15 @@ keeps showing the camera and stays usable with the spacebar.
 | `vision/worker.py` | Background detection thread (frames only while IDLE) |
 | `vision/controller.py` | Modes, keys, timer events and on-screen view for all of stage 2 |
 | `vision/dataset.py` | Background solve recorder (R) |
-| `vision/synth.py`, `vision/evaluate.py` | Synthetic cube renderer + accuracy evaluation |
+| `vision/synth.py`, `vision/evaluate.py` | Synthetic cube renderer (still faces; stage 3: animated cubies, hands, blur) + accuracy evaluation |
 | `tools/profile_vision.py` | Live-camera timing of detection vs. hand tracking |
 | `tools/eval_synthetic.py` | Synthetic accuracy report |
+| `vision/motion.py` | Stage 3: cube region from the palms, hand mask, optical flow -> one row of numbers per frame; `MotionWorker` thread |
+| `vision/motion_analysis.py` | Stage 3: rows -> turns / rotations / unclassified / half turns, pauses, TPS, timeline |
+| `vision/motion_controller.py` | Stage 3: worker per solve, practice mode, panel, keys |
+| `vision/practice.py` | Practice sequences (parser, true counts, random, paced cues) and `practice_data/` storage |
+| `vision/motion_eval.py`, `tools/evaluate_counts.py` | Accuracy against practice labels / synthetic clips |
+| `tools/profile_motion.py` | Live camera: processed FPS with and without stage 3 |
 | `keyinput.py` | Spacebar held-state (Windows `GetAsyncKeyState`) |
 | `config.py` / `config.yaml` | Defaults + user config |
 
@@ -295,6 +426,13 @@ They cover:
   defaults in warm/dim light, end-to-end scramble checks with the face rolled
   0/90/180/-90°, mirror handling, stillness and speed. Run `pytest -s
   tests/test_vision_synth.py` to see the numbers.
+* **Stage 3:** the practice sequence parser and counts, the paced cue schedule,
+  analysis on hand-made rows (turns, rotation, half turn, pauses, carrying the cube,
+  a hand moving alone), the worker never blocking and dropping frames instead, and
+  practice runs saved with labels and small feature files (no images). Also
+  end-to-end tests on rendered animated cubes: turn counts, rotations, R2 counted
+  once, deliberate pauses found, a still cube with motion outside the region giving
+  nothing, and extractor speed. Run `pytest -s tests/test_motion.py` to see the reports.
 * **Dataset and controller:** recordings with pre-roll and tail, frames dropped
   (never blocking) when the queue is full, aborted solves, and vision never being
   fed unless allowed.

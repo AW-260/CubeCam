@@ -306,3 +306,356 @@ def _py_rng(rng: np.random.Generator):
     import random
 
     return random.Random(int(rng.integers(0, 2**31)))
+
+
+# =========================================================================== stage 3: animated solves
+# A cube built from 26 cubies, so single layers (and the whole cube) can be
+# rotated part-way. Rendered at 30 fps with motion blur (sub-frame averaging),
+# a slowly drifting / wobbling pose, two skin-coloured hands holding it from
+# the sides (fingers on the face that points at the camera), sleeves, and an
+# optional moving distractor far from the cube. The default view is the one a
+# webcam in front of the solver gets: the back (B) face, a bit of U from above.
+import cube as _cube  # noqa: E402
+
+_CUBIES = [(x, y, z) for x in (-1, 0, 1) for y in (-1, 0, 1) for z in (-1, 0, 1) if (x, y, z) != (0, 0, 0)]
+_DIRS = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+SLEEVE_BGR = ((90, 60, 50), (25, 20, 20))
+
+
+def _axis_rot(axis: int, ang: float) -> np.ndarray:
+    c, s = math.cos(ang), math.sin(ang)
+    if axis == 0:
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+    if axis == 1:
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def move_spec(move: str) -> tuple[int, frozenset, float]:
+    """(axis, layers, total right-hand angle in radians) for a canonical move."""
+    base = move.rstrip("2'")
+    axis, layers, direction = _cube._MOVE_DEFS[base]
+    q = 2 if move.endswith("2") else -1 if move.endswith("'") else 1
+    return axis, layers, direction * q * math.pi / 2
+
+
+def _build_cubie_faces():
+    """Static arrays for all 26*6 cubie faces: centre, normal, 4 corners, facelet index (-1 = body), cubie."""
+    cents, norms, corners, fidx, pos = [], [], [], [], []
+    for p in _CUBIES:
+        for n in _DIRS:
+            a = [i for i in range(3) if n[i] == 0]
+            u = np.zeros(3)
+            v = np.zeros(3)
+            u[a[0]] = 0.5
+            v[a[1]] = 0.5
+            c = np.array(p, float) + 0.5 * np.array(n, float)
+            cents.append(c)
+            norms.append(n)
+            corners.append([c - u - v, c + u - v, c + u + v, c - u + v])
+            fidx.append(_cube._INDEX.get((p, n), -1))
+            pos.append(p)
+    return np.array(cents), np.array(norms, float), np.array(corners), np.array(fidx), np.array(pos)
+
+
+_CF_CENT, _CF_NORM, _CF_CORN, _CF_FIDX, _CF_POS = _build_cubie_faces()
+
+
+@dataclass
+class TimedMove:
+    move: str            # canonical ("R", "U2", "y'")
+    kind: str            # "turn" | "rotation"
+    t0: float
+    t1: float
+
+
+@dataclass
+class MotionScript:
+    moves: list[TimedMove]
+    duration: float
+    pauses: list[tuple[float, float]] = field(default_factory=list)   # deliberate pauses (P tokens)
+
+    @property
+    def turns(self) -> int:
+        return sum(m.kind == "turn" for m in self.moves)
+
+    @property
+    def rotations(self) -> int:
+        return sum(m.kind == "rotation" for m in self.moves)
+
+    @property
+    def half_turns(self) -> int:
+        return sum(m.kind == "turn" and m.move.endswith("2") for m in self.moves)
+
+    def active_at(self, t) -> np.ndarray:
+        t = np.asarray(t, float)
+        out = np.zeros(t.shape, bool)
+        for m in self.moves:
+            out |= (t >= m.t0) & (t <= m.t1)
+        return out
+
+
+def make_script(steps, rng: np.random.Generator, quarter=(0.20, 0.34), half_factor=(1.45, 1.85),
+                rotation=(0.32, 0.50), gap=(0.10, 0.45), lead=0.8, tail=0.6) -> MotionScript:
+    """Timed performance of practice steps (vision.practice.Step list) at roughly 1-2 turns per second."""
+    t = lead
+    moves, pauses = [], []
+    for s in steps:
+        if s.kind == "pause":
+            pauses.append((t, t + s.seconds))
+            t += s.seconds
+            continue
+        if s.kind == "rotation":
+            d = rng.uniform(*rotation) * (1.5 if s.move.endswith("2") else 1.0)
+        else:
+            d = rng.uniform(*quarter) * (rng.uniform(*half_factor) if s.move.endswith("2") else 1.0)
+        moves.append(TimedMove(s.move, s.kind, t, t + d))
+        t += d + rng.uniform(*gap)
+    return MotionScript(moves, t + tail, pauses)
+
+
+@dataclass
+class MotionFrame:
+    t: float
+    image: np.ndarray
+    hands: list                                     # 21x2 normalised landmarks per detected hand (raw image)
+    cube_box: tuple[float, float, float, float]     # normalised x, y, w, h of the cube silhouette
+
+
+def _smooth(x: float) -> float:
+    x = min(1.0, max(0.0, x))
+    return x * x * (3 - 2 * x)
+
+
+class MotionRenderer:
+    """Renders a MotionScript frame by frame (a generator, so clips never sit in memory)."""
+
+    def __init__(self, rng: np.random.Generator, width: int = 640, height: int = 360, fps: float = 30.0,
+                 face_px: float | None = None, base_pose=(180.0, 20.0, 0.0), stickerless: bool = False,
+                 blur_subframes: int = 3, exposure: float = 0.55, wobble: float = 3.0, sway: float = 0.03,
+                 lift: bool = True, hands: bool = True, hand_dropout: float = 0.03, distractor: bool = True,
+                 landmark_noise: float = 1.5, lighting: Lighting | None = None):
+        self.rng = rng
+        self.W, self.H, self.fps = width, height, fps
+        self.f = 0.9 * width
+        self.face_px = face_px if face_px is not None else float(rng.uniform(0.30, 0.42) * height)
+        self.base = [math.radians(a) for a in base_pose]
+        self.base[0] += math.radians(rng.uniform(-15, 15))
+        self.base[1] += math.radians(rng.uniform(-6, 6))
+        self.stickerless = stickerless
+        self.K = max(1, int(blur_subframes))
+        self.exposure = exposure / fps
+        self.wobble = math.radians(wobble)
+        self.sway = sway
+        self.lift = lift
+        self.hands_on = hands
+        self.hand_dropout = hand_dropout
+        self.distractor = distractor
+        self.lm_noise = landmark_noise
+        self.lighting = lighting or Lighting.random(rng, 0.7)
+        self.lighting.blur = min(self.lighting.blur, 0.8)
+        self.palette = {c: _jitter(rng, STICKER_BGR[c]) for c in "WYROGB"}
+        self.body = np.array([18, 18, 20], float) + rng.uniform(0, 20)
+        self.skin = _jitter(rng, SKIN_BGR)
+        self.sleeve = _jitter(rng, SLEEVE_BGR)
+        self.bg = _background(rng, width, height).astype(np.float32)
+        self.sticker = 0.97 if stickerless else float(rng.uniform(0.84, 0.90))
+        light = np.array([rng.uniform(-0.4, 0.4), rng.uniform(-0.6, 0.1), -1.0])
+        self.light = light / np.linalg.norm(light)
+        self.phase = rng.uniform(0, 2 * math.pi, 6)
+        self.freq = rng.uniform(0.15, 0.45, 6)
+        self.cx0 = width * rng.uniform(0.42, 0.58)
+        self.cy0 = height * rng.uniform(0.38, 0.50)
+        L = self.lighting
+        yy, xx = np.mgrid[0:height, 0:width]
+        r = np.sqrt(((xx - width / 2) / (width / 2)) ** 2 + ((yy - height / 2) / (height / 2)) ** 2)
+        self.bg = np.clip(self.bg * (1 - L.vignette * np.clip(r, 0, 1.4) ** 2 / 2)[..., None], 0, 255)
+        self.bg8 = self.bg.astype(np.uint8)
+        # global gain / tint / gamma as one lookup table per channel (fast on uint8)
+        x = np.arange(256, dtype=np.float64)
+        self.lut = np.stack([np.clip((np.clip(x * L.gain * L.tint[c], 0, 255) / 255.0) ** L.gamma * 255.0, 0, 255)
+                             for c in range(3)], axis=-1).astype(np.uint8)[:, None, :]
+        self._noise = np.empty((height, width, 3), np.int16)
+        self.fingers = {side: [(float(rng.uniform(-0.55, 0.55)), float(rng.uniform(0.18, 0.34)))
+                               for _ in range(3)] for side in (0, 1)}
+        self._states: list[str] = []
+
+    # ------------------------------------------------------------------ pose / state
+    def _pose(self, t: float, script: MotionScript):
+        w = self.wobble
+        yaw = self.base[0] + w * math.sin(2 * math.pi * self.freq[0] * t + self.phase[0])
+        pitch = self.base[1] + w * math.sin(2 * math.pi * self.freq[1] * t + self.phase[1])
+        roll = self.base[2] + w * math.sin(2 * math.pi * self.freq[2] * t + self.phase[2])
+        cx = self.cx0 + self.sway * self.W * math.sin(2 * math.pi * self.freq[3] * t + self.phase[3])
+        cy = self.cy0 + self.sway * self.H * math.sin(2 * math.pi * self.freq[4] * t + self.phase[4])
+        if self.lift:   # the cube is lifted into view at the start and lowered at the end (hands carry it)
+            up = _smooth(t / 0.5) * _smooth((script.duration - t) / 0.5)
+            cy += (1 - up) * 0.25 * self.H
+        return _rot_matrix(yaw, pitch, roll), cx, cy
+
+    def _state_at(self, t: float, script: MotionScript):
+        """(facelet state before the current move, current move or None, progress 0..1)."""
+        if len(self._states) != len(script.moves) + 1:
+            self._states = [_cube.SOLVED]
+            for m in script.moves:
+                self._states.append(_cube.apply_moves(self._states[-1], m.move))
+        for i, m in enumerate(script.moves):
+            if t < m.t0:
+                return self._states[i], None, 0.0
+            if t < m.t1:
+                return self._states[i], m, _smooth((t - m.t0) / (m.t1 - m.t0))
+        return self._states[-1], None, 0.0
+
+    # ------------------------------------------------------------------ drawing
+    def _draw_cube(self, img: np.ndarray, t: float, script: MotionScript):
+        R, cx, cy = self._pose(t, script)
+        Z = self.f * 3.0 / self.face_px
+        T = np.array([(cx - self.W / 2) * Z / self.f, (cy - self.H / 2) * Z / self.f, Z])
+        state, mv, prog = self._state_at(t, script)
+        cents, norms, corns = _CF_CENT, _CF_NORM, _CF_CORN
+        if mv is not None:
+            axis, layers, ang = move_spec(mv.move)
+            Rl = _axis_rot(axis, ang * prog)
+            sel = np.isin(_CF_POS[:, axis], list(layers))
+            cents, norms, corns = cents.copy(), norms.copy(), corns.copy()
+            cents[sel] = cents[sel] @ Rl.T
+            norms[sel] = norms[sel] @ Rl.T
+            corns[sel] = corns[sel] @ Rl.T
+        flip = np.array([1, -1, -1])
+        c_cam = (cents @ R.T) * flip + T
+        n_cam = (norms @ R.T) * flip
+        k_cam = (corns @ R.T) * flip + T
+        vis = np.einsum("ij,ij->i", n_cam, -c_cam) > 0
+        order = np.argsort(-c_cam[:, 2])
+        colors = to_colors(state)
+        f, W2, H2 = self.f, self.W / 2, self.H / 2
+        pts2 = np.stack([f * k_cam[..., 0] / k_cam[..., 2] + W2, f * k_cam[..., 1] / k_cam[..., 2] + H2], -1)
+        seam = np.array([45, 45, 48], float)
+        for i in order:
+            if not vis[i]:
+                continue
+            shade = 0.55 + 0.45 * max(0.0, float(n_cam[i] @ self.light))
+            quad = pts2[i]
+            fi = _CF_FIDX[i]
+            body = seam if self.stickerless and fi >= 0 else self.body
+            cv2.fillConvexPoly(img, np.round(quad * 4).astype(np.int32), tuple(float(v) for v in body * shade),
+                               cv2.LINE_AA, shift=2)
+            if fi >= 0:
+                c = quad.mean(axis=0)
+                sq = c + (quad - c) * self.sticker
+                col = self.palette[colors[fi]] * shade
+                cv2.fillConvexPoly(img, np.round(sq * 4).astype(np.int32), tuple(float(v) for v in col),
+                                   cv2.LINE_AA, shift=2)
+        box3 = np.array([[x, y, z] for x in (-1.5, 1.5) for y in (-1.5, 1.5) for z in (-1.5, 1.5)])
+        b_cam = (box3 @ R.T) * flip + T
+        b2 = np.stack([f * b_cam[:, 0] / b_cam[:, 2] + W2, f * b_cam[:, 1] / b_cam[:, 2] + H2], -1)
+        return b2, mv, prog
+
+    def _hand_geometry(self, box2: np.ndarray, mv, prog: float):
+        """Palm centres + finger segments in pixels for both hands, animated by the current move."""
+        x0, y0 = box2.min(axis=0)
+        x1, y1 = box2.max(axis=0)
+        cw, ch = x1 - x0, y1 - y0
+        ycen = (y0 + y1) / 2 + 0.08 * ch
+        hands = []
+        for side in (0, 1):                       # 0 = image-left hand, 1 = image-right hand
+            sgn = -1 if side == 0 else 1
+            palm = np.array([(x0 if side == 0 else x1) + sgn * 0.10 * cw, ycen])
+            dy_hand = 0.0
+            flick = 0.0
+            if mv is not None:
+                base = mv.move.rstrip("2'")
+                bump = math.sin(math.pi * prog)
+                # after the 180-degree yaw the cube's R face is on the image LEFT
+                if (base in ("R", "Rw") and side == 0) or (base in ("L", "Lw") and side == 1):
+                    # the wrist turns with the layer, then regrips (out and back within the move)
+                    _, _, ang = move_spec(mv.move)
+                    dy_hand = -0.18 * ch * math.copysign(bump, ang) * sgn
+                elif base in ("U", "Uw", "D", "Dw") and side == (0 if mv.move.endswith("'") else 1):
+                    flick = bump
+                elif mv.kind == "rotation" and side == (1 if base == "y" else 0):
+                    palm = palm + np.array([sgn * 0.30 * cw * bump, -0.15 * ch * bump])
+            palm = palm + np.array([0.0, dy_hand])
+            fingers = []
+            for j, (fy, reach) in enumerate(self.fingers[side]):
+                b = np.array([palm[0] - sgn * 0.05 * cw, ycen + fy * ch * 0.8 + dy_hand])
+                tip = b + np.array([-sgn * reach * cw, -0.04 * ch])
+                if j == 0 and flick:
+                    tip = tip + np.array([-sgn * 0.35 * cw * flick, -0.25 * ch * flick])
+                fingers.append((b, tip))
+            hands.append((palm, fingers))
+        return hands, (cw, ch)
+
+    def _draw_hands(self, img, hands, size):
+        cw, ch = size
+        thick = max(3, int(0.11 * cw))
+        for side, (palm, fingers) in enumerate(hands):
+            sgn = -1 if side == 0 else 1
+            elbow = palm + np.array([sgn * 0.9 * cw, 1.6 * ch])
+            start = palm + np.array([sgn * 0.15 * cw, 0.3 * ch])
+            cv2.line(img, (int(start[0]), int(start[1])), (int(elbow[0]), int(elbow[1])),
+                     tuple(float(v) for v in self.sleeve), max(3, int(0.45 * cw)), cv2.LINE_AA)
+            cv2.ellipse(img, (int(palm[0]), int(palm[1])), (max(2, int(0.16 * cw)), max(2, int(0.26 * ch))), 0, 0,
+                        360, tuple(float(v) for v in self.skin), -1, cv2.LINE_AA)
+            for b, tip in fingers:
+                cv2.line(img, (int(b[0]), int(b[1])), (int(tip[0]), int(tip[1])),
+                         tuple(float(min(255.0, v * 1.03)) for v in self.skin), thick, cv2.LINE_AA)
+
+    def _landmarks(self, hands) -> list[np.ndarray]:
+        """MediaPipe-style 21 points: wrist 0, thumb 1-4, index/middle/ring MCP-PIP-DIP-TIP 5-16, pinky 17-20."""
+        out = []
+        for side, (palm, fingers) in enumerate(hands):
+            sgn = -1 if side == 0 else 1
+            fp = self.face_px
+            pts = np.zeros((21, 2))
+            pts[0] = palm + np.array([sgn * 0.10, 0.12]) * fp                  # wrist: outside and below
+            for k, (b, tip) in enumerate(fingers):                           # three fingers on the cube
+                for j in range(4):
+                    pts[5 + 4 * k + j] = b + (tip - b) * j / 3
+            pin = palm + np.array([0.0, 0.14]) * fp                          # pinky curled under the palm
+            for j in range(4):
+                pts[17 + j] = pin + np.array([-sgn * 0.03 * j, 0.02 * j]) * fp
+            for j in range(4):                                               # thumb along the palm's top
+                pts[1 + j] = palm + np.array([-sgn * 0.03 * j, -0.10 - 0.02 * j]) * fp
+            pts += self.rng.normal(0, self.lm_noise, pts.shape)
+            out.append((pts / [self.W, self.H]).astype(np.float32))
+        return out
+
+    def frames(self, script: MotionScript):
+        """Yield a MotionFrame for t = 0, 1/fps, ... up to script.duration."""
+        n = int(script.duration * self.fps)
+        L = self.lighting
+        for k in range(n):
+            t = k / self.fps
+            acc = np.zeros((self.H, self.W, 3), np.uint16)
+            hands_geo, box = None, None
+            for s in range(self.K):
+                ts = t + self.exposure * (s / (self.K - 1) - 0.5) if self.K > 1 else t
+                img = self.bg8.copy()
+                if self.distractor:   # something moving far from the cube (a ball, someone's arm ...)
+                    dx = 0.08 * self.W * math.sin(2 * math.pi * 0.7 * ts)
+                    cv2.circle(img, (int(0.08 * self.W + dx), int(0.88 * self.H)), int(0.05 * self.H),
+                               (40, 160, 230), -1, cv2.LINE_AA)
+                box2, mv, prog = self._draw_cube(img, ts, script)
+                if self.hands_on:
+                    hg, size = self._hand_geometry(box2, mv, prog)
+                    self._draw_hands(img, hg, size)
+                    if s == self.K // 2:
+                        hands_geo = hg
+                if s == self.K // 2:
+                    box = box2
+                acc += img
+            img = (acc // self.K).astype(np.uint8) if self.K > 1 else img
+            img = cv2.LUT(img, self.lut)
+            if L.blur > 0.2:
+                img = cv2.GaussianBlur(img, (0, 0), L.blur)
+            cv2.randn(self._noise, 0, L.noise)
+            img = np.clip(img.astype(np.int16) + self._noise, 0, 255).astype(np.uint8)
+            ok, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(L.jpeg)])
+            img = cv2.imdecode(enc, cv2.IMREAD_COLOR) if ok else img
+            lms = []
+            if hands_geo is not None:
+                lms = [lm for lm in self._landmarks(hands_geo) if self.rng.random() >= self.hand_dropout]
+            x0, y0 = box.min(axis=0)
+            x1, y1 = box.max(axis=0)
+            yield MotionFrame(t, img, lms, (x0 / self.W, y0 / self.H, (x1 - x0) / self.W, (y1 - y0) / self.H))

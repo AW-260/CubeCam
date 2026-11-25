@@ -55,6 +55,27 @@ dataset:
   tail: 0.5            # seconds kept after the stop
   max_width: 0         # 0 = full camera resolution; e.g. 960 to save disk space
 
+# Stage 3: move count, TPS and turning/pause timeline, measured during SOLVING from motion in the
+# cube region (between your palms). Only small numbers are kept, never images.
+motion:
+  enabled: true
+  crop: 128            # the cube region is analysed at crop x crop px
+  roi_scale: 1.0       # cube region side = roi_scale x distance between the palm centres
+  roi_dy: 0.0          # shift the region down (+) / up (-) by this fraction of its side
+  default_roi: [0.5, 0.45, 0.40]   # x, y, size (fractions of the frame) until both hands are seen
+  flow_preset: 1       # optical flow quality: 0 fastest, 1 fast, 2 medium
+  save_features: practice   # practice | all | none: keep per-frame motion numbers (~2 KB/s) for re-analysis
+  features_path: motion_data
+  analysis: {}         # threshold overrides, e.g. {on: 0.15, rot_hi: 0.65} (see vision/motion_analysis.py)
+
+# P toggles practice mode: perform a known sequence so measured counts can be checked against the truth.
+practice:
+  path: practice_data  # practice.json + features/*.npz (git-ignored)
+  tempo: 1.0           # cued moves per second (+/- in practice mode); 0 = free pace
+  lead_in: 2.0         # seconds after the start before the first cue
+  metronome: false     # beep on every cue
+  sequences: null      # your own list, e.g. ["(R U R' U')x6", "random"]; null = built-in list
+
 ui:
   window_name: CubeCam
   keyboard_canvas: [1280, 720]   # window size when there is no camera

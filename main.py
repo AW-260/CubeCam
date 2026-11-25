@@ -1,4 +1,4 @@
-"""CubeCam - webcam-triggered Rubik's cube timer (stage 2: + cube vision).
+"""CubeCam - webcam-triggered Rubik's cube timer (stage 2: + cube vision, stage 3: move count / TPS).
 
 Run:  python main.py [--config config.yaml] [--no-camera]
 """
@@ -27,6 +27,7 @@ from storage import SolveStore
 from timer_state import EventType, State, TimerConfig, TimerStateMachine
 from ui import GREEN, ORANGE, RED, WHITE, YELLOW, Renderer, ViewModel
 from vision.controller import VisionController
+from vision.motion_controller import MotionController
 
 BASE = Path(__file__).resolve().parent
 
@@ -107,6 +108,9 @@ class App:
             self.camera.listeners.append(self.vision.recorder.on_frame)
         self._rec_open = False
         startup_msgs += self.vision.startup_messages
+        self.motion = MotionController(c, _resolve, self.say, have_camera=self.camera is not None,
+                                       beep=beep if self.audio else None)
+        startup_msgs += self.motion.startup_messages
         if self.solves:
             startup_msgs.append(f"Loaded {len(self.solves)} solves from {self.store.path.name}")
         if startup_msgs:
@@ -169,6 +173,8 @@ class App:
         for e in events:
             if e.type in (EventType.INSPECTION_START, EventType.SOLVE_START):
                 self._begin_recording(e.t)
+            if e.type == EventType.SOLVE_START:
+                self.motion.on_solve_start(e.t)
             if e.type == EventType.INSPECTION_WARNING:
                 sec = int(e.data)
                 self._flash_color = ORANGE if sec < 12 else RED
@@ -179,6 +185,12 @@ class App:
             elif e.type == EventType.SOLVE_STOP:
                 r = e.data
                 fps = self.effective_fps()
+                cam = self.camera
+                practicing = self.motion.practicing
+                motion = self.motion.on_solve_end(r.start, r.end, {
+                    "processed_fps": round(fps, 1) if fps else None,
+                    "camera": None if cam is None else {"width": cam.width, "height": cam.height,
+                                                        "measured_fps": round(cam.measured_fps, 1)}})
                 solve = Solve(
                     time=round(r.time, 4),
                     penalty=r.penalty,
@@ -186,9 +198,13 @@ class App:
                     timestamp=datetime.now().isoformat(timespec="seconds"),
                     fps=round(fps, 1) if fps else None,
                     inspection=None if r.inspection_time is None else round(r.inspection_time, 3),
+                    motion=motion,
                 )
-                self.solves.append(solve)
-                self.save()
+                if practicing:     # practice runs are stored separately (practice_data/), not as solves
+                    self.say(f"Practice run saved ({format_time(r.time)})", 3.0)
+                else:
+                    self.solves.append(solve)
+                    self.save()
                 self.vision.on_solve_end(e.t, {
                     "time": solve.time, "penalty": solve.penalty.value, "inspection_time": solve.inspection,
                     "solve_start": r.start, "solve_end": r.end, "processed_fps": solve.fps,
@@ -200,6 +216,7 @@ class App:
             elif e.type == EventType.ABORT:
                 self.say("Aborted - solve not recorded", 2.0)
                 self.vision.on_abort(e.t)
+                self.motion.on_abort()
                 self._rec_open = False
 
     def save(self) -> None:
@@ -219,6 +236,8 @@ class App:
         if ch == "q":
             return False
         if self.vision.on_key(key, ch, idle=self.machine.state == State.IDLE):
+            return True
+        if self.motion.on_key(ch, idle=self.machine.state == State.IDLE):
             return True
         if key & 0xFF == 27:
             self.handle_events(self.machine.abort(t))
@@ -315,6 +334,9 @@ class App:
         vline = self.vision.status_line()
         if vline:
             status.append(vline)
+        mline = self.motion.status_line()
+        if mline:
+            status.append(mline)
 
         debug = {
             "state": st.value,
@@ -350,6 +372,7 @@ class App:
             show_debug=self.show_debug,
             debug=debug,
             vision=self.vision.view(self.show_debug),
+            motion=self.motion.view(self.solves, t, solving=st == State.SOLVING),
         )
 
     # ------------------------------------------------------------------- loop
@@ -394,6 +417,10 @@ class App:
                 # While calibrating/scanning, hands holding the cube up must not arm the timer.
                 hands = sample.active and not self.vision.modal
                 self.handle_events(self.machine.update(t, hands or space_down))
+                if self.machine.state == State.SOLVING:
+                    if frame is not None:   # stage 3: hand the RAW frame over by reference, O(1)
+                        self.motion.feed(frame.image, t, sample.debug.get("hands"), self.mirror)
+                    self.motion.tick(t)
                 if self.camera is not None and frame is not None:
                     m = self.machine
                     allowed = m.state == State.IDLE and not m.zone_active and not m.raw_active
@@ -413,6 +440,7 @@ class App:
         if self.camera is not None:
             self.camera.close()
         self.vision.close()
+        self.motion.close()
         self.detector.close()
         cv2.destroyAllWindows()
 

@@ -8,3 +8,6 @@ solves.*.json
 # stage 2
 calibration.json
 datasets/
+# stage 3
+practice_data/
+motion_data/
