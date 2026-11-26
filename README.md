@@ -1,5 +1,7 @@
 # CubeCam
 
+**A webcam Rubik's cube timer: rest your hands on a holographic AR mat on your desk, lift them to start, put them back to stop.**
+
 A csTimer-style Rubik's cube timer that uses your webcam as a virtual stackmat:
 rest both hands in the on-screen start zone, lift them to start, put them back
 to stop. Stage 1 of a larger project (cube detection, colour reading and move
@@ -499,3 +501,7 @@ and +2), scrambles and storage. `tests/test_zone.py` covers the zone:
   the estimated 4th marker and the hold when markers are covered, and the printed
   sheet is detectable with a well-formed PDF.
 * **Saving the zone:** comments and other settings in `config.yaml` are kept.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
